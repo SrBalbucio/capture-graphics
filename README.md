@@ -90,6 +90,9 @@ a temp dir at runtime (`-Djava.library.path=capture-native/build` also works).
 Modular runs on JDK 23+ need `--enable-native-access` (surefire already sets it
 for tests).
 
+Logging goes through `System.Logger` (JUL by default, no dependencies). To route
+it into SLF4J/Logback, add `jul-to-slf4j` and install its bridge handler.
+
 ## Roadmap
 
 - Consumer bridges (Vulkan/OpenGL/NVENC) importing `GpuFrame` handles — owned by

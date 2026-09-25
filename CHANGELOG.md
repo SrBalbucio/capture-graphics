@@ -4,6 +4,15 @@
 
 - New `capture-all` aggregator module: single dependency with every bundled
   backend; runtime pick + graceful fallback via ServiceLoader.
+- Region capture: `CaptureConfig.region()` crops natively end-to-end
+  (`CopySubresourceRegion` on the GPU + sub-rect CPU copy), so outside pixels
+  never cross the bus; dirty rects are delivered region-relative.
+- Snapshot semantics: `CaptureConfig.retainLast()` + `CaptureSession.latest()`
+  for polling consumers (session-owned, must not be closed).
+- `AwtFrames` fast path: `TYPE_INT_ARGB` + one bulk LE transfer, no swizzle.
+- `RobotBackend`: multi-monitor enumeration, bulk int copy, region + latest support.
+- New `CaptureException.Reason` values: `INVALID_ARG` (region outside display).
+- Logging polish: no locale number grouping; JUL bridge documented.
 
 ## 1.0.0 — first release
 

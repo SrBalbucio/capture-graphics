@@ -34,4 +34,47 @@ class RobotBackendTest {
             assertEquals(5, session.metrics().delivered());
         }
     }
+
+    @Test
+    void regionAndLatest() throws Exception {
+        assumeFalse(GraphicsEnvironment.isHeadless(), "needs display");
+        var backend = new RobotBackend();
+        assertFalse(backend.displays().isEmpty(), "at least the primary screen");
+        var display = backend.displays().get(0);
+        var region = new balbucio.capturegraphics.api.Rect(
+                display.x() + 5, display.y() + 5, 160, 100);
+        var config = CaptureConfig.builder().region(region).retainLast(true).build();
+        try (var session = backend.open(config)) {
+            try (var f = session.acquire()) {
+                assertNotNull(f);
+                assertEquals(160, f.width());
+                assertEquals(100, f.height());
+                assertEquals(160 * 100 * 4, f.data().remaining());
+                // Pixels must be real screen content, not zeros (bulk int path).
+                var data = f.data();
+                boolean nonZero = false;
+                for (int i = 0; i < data.remaining(); i += 4096) {
+                    if (data.get(i) != 0) {
+                        nonZero = true;
+                        break;
+                    }
+                }
+                assertTrue(nonZero, "bulk int copy must carry real pixels");
+            }
+            var latest = session.latest();
+            assertTrue(latest.isPresent());
+            assertEquals(160, latest.get().width());
+        }
+    }
+
+    @Test
+    void invalidRegionRejected() {
+        assumeFalse(GraphicsEnvironment.isHeadless(), "needs display");
+        var config = CaptureConfig.builder()
+                .region(new balbucio.capturegraphics.api.Rect(-100000, -100000, 10, 10))
+                .build();
+        var e = assertThrows(balbucio.capturegraphics.api.CaptureException.class,
+                () -> new RobotBackend().open(config));
+        assertEquals(balbucio.capturegraphics.api.CaptureException.Reason.INVALID_ARG, e.reason());
+    }
 }
