@@ -8,7 +8,7 @@
         <artifactId>capture-graphics-parent</artifactId>
         <version>1.0-SNAPSHOT</version>
     </parent>
-    <artifactId>capture-bench</artifactId>
+    <artifactId>capture-backend-win-dxgi</artifactId>
     <dependencies>
         <dependency>
             <groupId>balbucio.capturegraphics</groupId>
@@ -19,20 +19,8 @@
             <artifactId>capture-core</artifactId>
         </dependency>
         <dependency>
-            <groupId>balbucio.capturegraphics</groupId>
-            <artifactId>capture-backend-robot</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>balbucio.capturegraphics</groupId>
-            <artifactId>capture-backend-win-dxgi</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.openjdk.jmh</groupId>
-            <artifactId>jmh-core</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.openjdk.jmh</groupId>
-            <artifactId>jmh-generator-annprocess</artifactId>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
         </dependency>
     </dependencies>
 </project>

@@ -14,6 +14,7 @@
         <module>capture-api</module>
         <module>capture-core</module>
         <module>capture-backend-robot</module>
+        <module>capture-backend-win-dxgi</module>
         <module>capture-compat-awt</module>
         <module>capture-bench</module>
     </modules>
@@ -40,6 +41,11 @@
             <dependency>
                 <groupId>balbucio.capturegraphics</groupId>
                 <artifactId>capture-backend-robot</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>balbucio.capturegraphics</groupId>
+                <artifactId>capture-backend-win-dxgi</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
