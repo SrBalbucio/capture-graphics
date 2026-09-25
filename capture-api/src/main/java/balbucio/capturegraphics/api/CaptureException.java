@@ -8,6 +8,7 @@ public class CaptureException extends Exception {
         MODE_CHANGED,
         ACCESS_DENIED,
         UNSUPPORTED_FORMAT,
+        UNSUPPORTED_OPERATION,
         CLOSED,
         NATIVE_ERROR
     }

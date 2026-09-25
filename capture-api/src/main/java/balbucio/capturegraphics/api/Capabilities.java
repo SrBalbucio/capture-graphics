@@ -10,12 +10,13 @@ public record Capabilities(
         boolean cursorCapture,
         int maxWidth,
         int maxHeight,
-        boolean hdr) {
+        boolean hdr,
+        boolean gpuSharedTextures) {
     public boolean supports(FrameFormat f) {
         return formats.contains(f);
     }
 
     public static Capabilities robotFallback(int w, int h) {
-        return new Capabilities(Set.of(FrameFormat.BGRA_8), false, false, w, h, false);
+        return new Capabilities(Set.of(FrameFormat.BGRA_8), false, false, w, h, false, false);
     }
 }

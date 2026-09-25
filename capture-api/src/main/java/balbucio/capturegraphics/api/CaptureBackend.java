@@ -12,4 +12,13 @@ public interface CaptureBackend {
     List<DisplayId> displays();
 
     CaptureSession open(CaptureConfig config) throws CaptureException;
+
+    /**
+     * Open a GPU-resident session. Default: unsupported (e.g. pure-CPU backends).
+     * Advertise support via {@link Capabilities#gpuSharedTextures()}.
+     */
+    default GpuCaptureSession openGpu(CaptureConfig config) throws CaptureException {
+        throw new CaptureException(CaptureException.Reason.UNSUPPORTED_OPERATION,
+                "Backend '" + id() + "' has no GPU session");
+    }
 }
