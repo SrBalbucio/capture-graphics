@@ -1,12 +1,15 @@
-// dxgi_bridge.cpp — Windows DXGI Desktop Duplication backend (MVP).
+// dxgi_bridge.cpp — Windows DXGI Desktop Duplication backend (Phase 2).
 //
-// Captures the primary output via IDXGIOutputDuplication into a CPU-readable
-// staging texture, then copies BGRA rows into the Java-owned direct buffer.
-// Single output, BGRA_8 only, cursor excluded, full-frame only.
+// Captures one output via IDXGIOutputDuplication into a CPU-readable staging
+// texture, then copies BGRA rows into the Java-owned direct buffer. In the same
+// native round-trip it also reports dirty/move rects and pointer state, so the
+// Java hot path stays allocation-free with a single JNI transition per frame.
 //
 // Error recovery contract: ACCESS_LOST / DEVICE_REMOVED mean the Java session
-// must close and reopen the handle (mode change, display switch, protected content).
-// TIMEOUT is normal (no new frame within timeoutMs) and keeps the handle usable.
+// must close and reopen the handle (mode change, display switch, protected
+// content). TIMEOUT is normal (no new frame within timeoutMs).
+//
+// Rect coordinates are output-relative (0,0 = top-left of the captured output).
 
 #define CAPTURE_DXGI_BUILD 1
 
@@ -15,10 +18,12 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dxgi1_6.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <string>
+#include <new>
 
 #ifdef __GNUC__
 #define CG_UNUSED __attribute__((unused))
@@ -35,6 +40,12 @@ struct CgContext {
     int stagingH = 0;
     int width = 0;
     int height = 0;
+    int originX = 0;
+    int originY = 0;
+    // Cached pointer shape (updated only when DXGI reports a new one).
+    uint8_t *ptrShape = nullptr;
+    int32_t ptrShapeSize = 0;
+    int32_t ptrW = 0, ptrH = 0, ptrHotX = 0, ptrHotY = 0, ptrType = CG_PTR_NONE;
     char lastError[512] = {0};
 };
 
@@ -95,6 +106,79 @@ static bool ensureStaging(CgContext *c, int w, int h) {
     return true;
 }
 
+// --- Output enumeration (no device needed) ----------------------------------
+
+static IDXGIOutput *enumOutput(int adapter, int output, DXGI_OUTPUT_DESC *odesc) {
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) || !factory) {
+        return nullptr;
+    }
+    IDXGIAdapter *dxgiAdapter = nullptr;
+    HRESULT hr = factory->EnumAdapters((UINT)(adapter < 0 ? 0 : adapter), &dxgiAdapter);
+    factory->Release();
+    if (FAILED(hr) || !dxgiAdapter) {
+        return nullptr;
+    }
+    IDXGIOutput *dxgiOutput = nullptr;
+    hr = dxgiAdapter->EnumOutputs((UINT)output, &dxgiOutput);
+    dxgiAdapter->Release();
+    if (FAILED(hr) || !dxgiOutput) {
+        return nullptr;
+    }
+    if (odesc) {
+        memset(odesc, 0, sizeof(*odesc));
+        dxgiOutput->GetDesc(odesc);
+    }
+    return dxgiOutput; // caller releases
+}
+
+int32_t cg_dxgi_output_count(int adapter, int32_t *out) {
+    if (!out) {
+        return CG_ERR_INVALID_ARG;
+    }
+    int32_t n = 0;
+    for (;; n++) {
+        IDXGIOutput *o = enumOutput(adapter, n, nullptr);
+        if (!o) {
+            break;
+        }
+        o->Release();
+    }
+    *out = n;
+    return CG_OK;
+}
+
+int32_t cg_dxgi_output_desc(int adapter, int output, CgOutputDesc *out) {
+    if (!out || adapter < 0 || output < 0) {
+        return CG_ERR_INVALID_ARG;
+    }
+    DXGI_OUTPUT_DESC odesc = {};
+    IDXGIOutput *dxgiOutput = enumOutput(adapter, output, &odesc);
+    if (!dxgiOutput) {
+        return CG_ERR_OPEN;
+    }
+    out->x = (int32_t)odesc.DesktopCoordinates.left;
+    out->y = (int32_t)odesc.DesktopCoordinates.top;
+    out->width = (int32_t)(odesc.DesktopCoordinates.right - odesc.DesktopCoordinates.left);
+    out->height = (int32_t)(odesc.DesktopCoordinates.bottom - odesc.DesktopCoordinates.top);
+    out->hdr = 0;
+    IDXGIOutput6 *output6 = nullptr;
+    if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput6), (void **)&output6)) &&
+        output6) {
+        DXGI_OUTPUT_DESC1 d1 = {};
+        if (SUCCEEDED(output6->GetDesc1(&d1))) {
+            if (d1.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+                out->hdr = 1;
+            }
+        }
+        output6->Release();
+    }
+    dxgiOutput->Release();
+    return CG_OK;
+}
+
+// --- Open / info / close -----------------------------------------------------
+
 int32_t cg_dxgi_open(int adapter, int output, CgHandle *out) {
     if (!out || adapter < 0 || output < 0) {
         return CG_ERR_INVALID_ARG;
@@ -107,9 +191,6 @@ int32_t cg_dxgi_open(int adapter, int output, CgHandle *out) {
     }
 
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-#if !defined(NDEBUG)
-    // Keep release behavior; debug layer only when explicitly available.
-#endif
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
                                   D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     D3D_FEATURE_LEVEL picked = D3D_FEATURE_LEVEL_11_0;
@@ -122,6 +203,18 @@ int32_t cg_dxgi_open(int adapter, int output, CgHandle *out) {
         return CG_ERR_OPEN;
     }
 
+    CgOutputDesc odesc = {};
+    if (cg_dxgi_output_desc(adapter, output, &odesc) != CG_OK) {
+        setError(c, "output index out of range (see cg_dxgi_output_count)");
+        cg_dxgi_close(c);
+        return CG_ERR_OPEN;
+    }
+    c->originX = odesc.x;
+    c->originY = odesc.y;
+    c->width = odesc.width;
+    c->height = odesc.height;
+
+    // Bind the duplication session to the same adapter/output pair.
     IDXGIDevice *dxgiDevice = nullptr;
     hr = c->device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgiDevice);
     if (FAILED(hr) || !dxgiDevice) {
@@ -130,41 +223,31 @@ int32_t cg_dxgi_open(int adapter, int output, CgHandle *out) {
         return CG_ERR_OPEN;
     }
     IDXGIAdapter *dxgiAdapter = nullptr;
-    hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void **)&dxgiAdapter);
-    dxgiDevice->Release();
-    if (FAILED(hr) || !dxgiAdapter) {
-        setErrorHr(c, "GetParent(IDXGIAdapter) failed", hr);
-        cg_dxgi_close(c);
-        return CG_ERR_OPEN;
-    }
-    // NOTE MVP: `adapter` selects among enumerated adapters; 0 = default.
     if (adapter > 0) {
         IDXGIFactory1 *factory = nullptr;
         if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) &&
             factory) {
-            IDXGIAdapter *alt = nullptr;
-            if (SUCCEEDED(factory->EnumAdapters((UINT)adapter, &alt)) && alt) {
-                dxgiAdapter->Release();
-                dxgiAdapter = alt;
-            }
+            factory->EnumAdapters((UINT)adapter, &dxgiAdapter);
             factory->Release();
         }
     }
-
+    if (!dxgiAdapter) {
+        hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void **)&dxgiAdapter);
+    }
+    dxgiDevice->Release();
+    if (!dxgiAdapter) {
+        setErrorHr(c, "adapter lookup failed", hr);
+        cg_dxgi_close(c);
+        return CG_ERR_OPEN;
+    }
     IDXGIOutput *dxgiOutput = nullptr;
     hr = dxgiAdapter->EnumOutputs((UINT)output, &dxgiOutput);
     dxgiAdapter->Release();
     if (FAILED(hr) || !dxgiOutput) {
-        setErrorHr(c, "EnumOutputs failed (output index out of range?)", hr);
+        setErrorHr(c, "EnumOutputs failed", hr);
         cg_dxgi_close(c);
         return CG_ERR_OPEN;
     }
-    DXGI_OUTPUT_DESC odesc = {};
-    if (SUCCEEDED(dxgiOutput->GetDesc(&odesc))) {
-        c->width = (int)(odesc.DesktopCoordinates.right - odesc.DesktopCoordinates.left);
-        c->height = (int)(odesc.DesktopCoordinates.bottom - odesc.DesktopCoordinates.top);
-    }
-
     IDXGIOutput1 *output1 = nullptr;
     hr = dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), (void **)&output1);
     dxgiOutput->Release();
@@ -180,11 +263,6 @@ int32_t cg_dxgi_open(int adapter, int output, CgHandle *out) {
         cg_dxgi_close(c);
         return CG_ERR_OPEN;
     }
-    if (c->width <= 0 || c->height <= 0) {
-        // Fall back to probing on first acquire; keep handle usable.
-        c->width = 0;
-        c->height = 0;
-    }
     *out = c;
     return CG_OK;
 }
@@ -199,15 +277,219 @@ int32_t cg_dxgi_info(CgHandle h, CgInfo *out) {
     return CG_OK;
 }
 
-int32_t cg_dxgi_acquire(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap,
-                        int timeoutMs, uint64_t *qpcOut) {
-    if (!h || !dst || dstStride <= 0 || dstCap <= 0) {
+// --- Rect + pointer helpers ---------------------------------------------------
+
+// Fetches move rects (capped). Always safe to call while a frame is acquired.
+// NOTE: the "required size" out-param is in BYTES, and a zero-size probe is
+// rejected with E_INVALIDARG — so fetch with a stack buffer first and grow on
+// MORE_DATA instead of probing with NULL.
+static void fetchMoves(CgContext *c, CgAcquireOut *out) {
+    out->moveCount = 0;
+    if (!out->moves) {
+        return;
+    }
+    DXGI_OUTDUPL_MOVE_RECT stack[64];
+    UINT gotBytes = 0;
+    HRESULT hr = c->dupl->GetFrameMoveRects(sizeof(stack), stack, &gotBytes);
+    const DXGI_OUTDUPL_MOVE_RECT *src = stack;
+    UINT count = 0;
+    DXGI_OUTDUPL_MOVE_RECT *heap = nullptr;
+    if (hr == DXGI_ERROR_MORE_DATA && gotBytes > 0 && gotBytes <= 4 * 1024 * 1024) {
+        heap = (DXGI_OUTDUPL_MOVE_RECT *)malloc(gotBytes);
+        if (heap) {
+            UINT got2 = 0;
+            if (SUCCEEDED(c->dupl->GetFrameMoveRects(gotBytes, heap, &got2))) {
+                src = heap;
+                count = got2 / (UINT)sizeof(*heap);
+            }
+        }
+    } else if (SUCCEEDED(hr)) {
+        count = gotBytes / (UINT)sizeof(*stack);
+    }
+    UINT n = count < (UINT)CG_MAX_MOVES ? count : (UINT)CG_MAX_MOVES;
+    for (UINT i = 0; i < n; i++) {
+        CgMove *m = &out->moves[out->moveCount++];
+        m->srcX = src[i].SourcePoint.x;
+        m->srcY = src[i].SourcePoint.y;
+        m->dstX = src[i].DestinationRect.left;
+        m->dstY = src[i].DestinationRect.top;
+        m->width = src[i].DestinationRect.right - src[i].DestinationRect.left;
+        m->height = src[i].DestinationRect.bottom - src[i].DestinationRect.top;
+    }
+    free(heap);
+}
+
+static void fetchDirties(CgContext *c, CgAcquireOut *out) {
+    out->dirtyCount = 0;
+    if (!out->dirty) {
+        return;
+    }
+    RECT stack[64];
+    UINT gotBytes = 0;
+    HRESULT hr = c->dupl->GetFrameDirtyRects(sizeof(stack), stack, &gotBytes);
+    const RECT *src = stack;
+    UINT count = 0;
+    RECT *heap = nullptr;
+    if (hr == DXGI_ERROR_MORE_DATA && gotBytes > 0 && gotBytes <= 4 * 1024 * 1024) {
+        heap = (RECT *)malloc(gotBytes);
+        if (heap) {
+            UINT got2 = 0;
+            if (SUCCEEDED(c->dupl->GetFrameDirtyRects(gotBytes, heap, &got2))) {
+                src = heap;
+                count = got2 / (UINT)sizeof(*heap);
+            }
+        }
+    } else if (SUCCEEDED(hr)) {
+        count = gotBytes / (UINT)sizeof(*stack);
+    }
+    UINT n = count < (UINT)CG_MAX_DIRTY ? count : (UINT)CG_MAX_DIRTY;
+    for (UINT i = 0; i < n; i++) {
+        CgRect *r = &out->dirty[out->dirtyCount++];
+        r->x = src[i].left;
+        r->y = src[i].top;
+        r->width = src[i].right - src[i].left;
+        r->height = src[i].bottom - src[i].top;
+    }
+    free(heap);
+}
+
+static int mapPtrType(UINT t) {
+    switch (t) {
+        case (UINT)DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME:
+            return CG_PTR_MONO;
+        case (UINT)DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR:
+            return CG_PTR_COLOR;
+        case (UINT)DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR:
+            return CG_PTR_MASKED;
+        default:
+            return CG_PTR_NONE;
+    }
+}
+
+// Refreshes the cached shape when DXGI reports a new one; position/visibility
+// come from the current frame info. Must be called while a frame is held.
+static void cacheShape(CgContext *c, const uint8_t *data, UINT size,
+                       const DXGI_OUTDUPL_POINTER_SHAPE_INFO *si) {
+    if (!data || size == 0 || size > 4 * 1024 * 1024 || !si || si->Width == 0 ||
+        si->Height == 0) {
+        return;
+    }
+    uint8_t *tmp = (uint8_t *)malloc(size);
+    if (!tmp) {
+        return;
+    }
+    memcpy(tmp, data, size);
+    free(c->ptrShape);
+    c->ptrShape = tmp;
+    c->ptrShapeSize = (int32_t)size;
+    c->ptrW = (int32_t)si->Width;
+    c->ptrH = (int32_t)si->Height;
+    c->ptrHotX = (int32_t)si->HotSpot.x;
+    c->ptrHotY = (int32_t)si->HotSpot.y;
+    c->ptrType = mapPtrType(si->Type);
+    if (c->ptrType == CG_PTR_MONO) {
+        c->ptrH /= 2; // mono buffer packs AND mask over XOR mask
+    }
+}
+
+// Refreshes the cached shape when DXGI reports a new one, then publishes the
+// cache into the caller's shape buffer. NOTE: like the rect APIs, a zero-size
+// probe is rejected — always fetch with a real buffer. Must be called while a
+// frame is held.
+static void fetchPointer(CgContext *c, const DXGI_OUTDUPL_FRAME_INFO *info, CgAcquireOut *out) {
+    out->ptrVisible = 0;
+    out->ptrX = info ? (info->PointerPosition.Position.x - c->originX) : 0;
+    out->ptrY = info ? (info->PointerPosition.Position.y - c->originY) : 0;
+    out->ptrW = c->ptrW;
+    out->ptrH = c->ptrH;
+    out->ptrHotX = c->ptrHotX;
+    out->ptrHotY = c->ptrHotY;
+    out->ptrType = c->ptrType;
+    out->ptrShapeSize = 0;
+
+    bool fresh = false; // caller buffer already holds the current shape
+    if (out->ptrShape && out->ptrShapeCap > 0) {
+        UINT required = 0;
+        DXGI_OUTDUPL_POINTER_SHAPE_INFO si = {};
+        HRESULT hr = c->dupl->GetFramePointerShape((UINT)out->ptrShapeCap, out->ptrShape,
+                                                   &required, &si);
+        if (SUCCEEDED(hr) && required > 0 && required <= (UINT)out->ptrShapeCap) {
+            cacheShape(c, (const uint8_t *)out->ptrShape, required, &si);
+            out->ptrShapeSize = (int32_t)required;
+            fresh = true;
+        } else if (hr == DXGI_ERROR_MORE_DATA && required > 0 && required <= 4 * 1024 * 1024) {
+            uint8_t *tmp = (uint8_t *)malloc(required);
+            if (tmp) {
+                UINT got = required;
+                DXGI_OUTDUPL_POINTER_SHAPE_INFO si2 = {};
+                if (SUCCEEDED(c->dupl->GetFramePointerShape(required, tmp, &got, &si2)) &&
+                    got > 0) {
+                    cacheShape(c, tmp, got, &si2);
+                }
+                free(tmp);
+            }
+        }
+        // required == 0 (or failure): shape unchanged — fall through to cache.
+    } else {
+        // No caller buffer: still track shape updates via a small scratch fetch.
+        uint8_t scratch[4096];
+        UINT required = 0;
+        DXGI_OUTDUPL_POINTER_SHAPE_INFO si = {};
+        HRESULT hr = c->dupl->GetFramePointerShape(sizeof(scratch), scratch, &required, &si);
+        if (SUCCEEDED(hr) && required > 0 && required <= sizeof(scratch)) {
+            cacheShape(c, scratch, required, &si);
+        } else if (hr == DXGI_ERROR_MORE_DATA && required > sizeof(scratch) &&
+                   required <= 4 * 1024 * 1024) {
+            uint8_t *tmp = (uint8_t *)malloc(required);
+            if (tmp) {
+                UINT got = required;
+                DXGI_OUTDUPL_POINTER_SHAPE_INFO si2 = {};
+                if (SUCCEEDED(c->dupl->GetFramePointerShape(required, tmp, &got, &si2)) &&
+                    got > 0) {
+                    cacheShape(c, tmp, got, &si2);
+                }
+                free(tmp);
+            }
+        }
+    }
+    if (c->ptrShape && c->ptrW > 0) {
+        if (info && info->PointerPosition.Visible) {
+            out->ptrVisible = 1;
+        }
+        out->ptrW = c->ptrW;
+        out->ptrH = c->ptrH;
+        out->ptrHotX = c->ptrHotX;
+        out->ptrHotY = c->ptrHotY;
+        out->ptrType = c->ptrType;
+        if (!fresh && out->ptrShape && out->ptrShapeCap > 0) {
+            int32_t n = c->ptrShapeSize < out->ptrShapeCap ? c->ptrShapeSize : out->ptrShapeCap;
+            memcpy(out->ptrShape, c->ptrShape, (size_t)n);
+            out->ptrShapeSize = n;
+        }
+    }
+}
+
+// --- Full acquisition ----------------------------------------------------------
+
+int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap,
+                             int timeoutMs, CgAcquireOut *out) {
+    if (!h || !dst || !out || dstStride <= 0 || dstCap <= 0) {
         return CG_ERR_INVALID_ARG;
     }
     if (!h->dupl || !h->device || !h->ctx) {
         setError(h, "handle not open");
         return CG_ERR_OPEN;
     }
+    // NOTE: never memset *out — it carries caller-owned buffer pointers.
+    out->qpc = 0;
+    out->width = 0;
+    out->height = 0;
+    out->moveCount = 0;
+    out->dirtyCount = 0;
+    out->ptrVisible = 0;
+    out->ptrX = out->ptrY = 0;
+    out->ptrW = out->ptrH = out->ptrHotX = out->ptrHotY = out->ptrType = 0;
+    out->ptrShapeSize = 0;
 
     IDXGIResource *res = nullptr;
     DXGI_OUTDUPL_FRAME_INFO info = {};
@@ -243,7 +525,7 @@ int32_t cg_dxgi_acquire(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap
     frame->GetDesc(&fdesc);
     if (fdesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
         snprintf(h->lastError, sizeof(h->lastError),
-                 "Unexpected desktop format %d (MVP supports B8G8R8A8 only)", (int)fdesc.Format);
+                 "Unexpected desktop format %d (only B8G8R8A8 supported)", (int)fdesc.Format);
         frame->Release();
         h->dupl->ReleaseFrame();
         return CG_ERR_COPY;
@@ -285,11 +567,16 @@ int32_t cg_dxgi_acquire(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap
     h->width = w;
     h->height = bh;
 
+    fetchMoves(h, out);
+    fetchDirties(h, out);
+    fetchPointer(h, &info, out);
+
     LARGE_INTEGER qpc;
     QueryPerformanceCounter(&qpc);
-    if (qpcOut) {
-        *qpcOut = (uint64_t)qpc.QuadPart;
-    }
+    out->qpc = (uint64_t)qpc.QuadPart;
+    out->width = w;
+    out->height = bh;
+
     h->dupl->ReleaseFrame();
     return rc;
 }
@@ -313,6 +600,7 @@ void cg_dxgi_close(CgHandle h) {
     if (!h) {
         return;
     }
+    free(h->ptrShape);
     if (h->staging) {
         h->staging->Release();
     }
@@ -369,24 +657,80 @@ JNIEXPORT jintArray JNICALL JNI_FN(nInfo)(JNIEnv *env, jclass CG_UNUSED cls, jlo
     return arr;
 }
 
+JNIEXPORT jint JNICALL JNI_FN(nOutputCount)(JNIEnv *env CG_UNUSED, jclass CG_UNUSED cls,
+                                            jint adapter) {
+    int32_t n = 0;
+    if (cg_dxgi_output_count((int)adapter, &n) != CG_OK) {
+        return 0;
+    }
+    return (jint)n;
+}
+
+JNIEXPORT jint JNICALL JNI_FN(nOutputDesc)(JNIEnv *env, jclass CG_UNUSED cls, jint adapter,
+                                           jint output, jintArray out) {
+    if (!out || env->GetArrayLength(out) < 5) {
+        return CG_ERR_INVALID_ARG;
+    }
+    CgOutputDesc d = {};
+    int32_t rc = cg_dxgi_output_desc((int)adapter, (int)output, &d);
+    if (rc == CG_OK) {
+        jint v[5] = {d.x, d.y, d.width, d.height, d.hdr};
+        env->SetIntArrayRegion(out, 0, 5, v);
+    }
+    return rc;
+}
+
 JNIEXPORT jint JNICALL JNI_FN(nAcquire)(JNIEnv *env, jclass CG_UNUSED cls, jlong handle,
-                                        jobject dst, jint stride, jint timeoutMs,
-                                        jlongArray qpcOut) {
+                                        jobject dst, jint stride, jint timeoutMs, jlongArray qpc,
+                                        jintArray meta, jobject moves, jobject dirties, jintArray ptr,
+                                        jobject shape) {
     CgHandle h = (CgHandle)(intptr_t)handle;
     if (!h || !dst || stride <= 0) {
         return CG_ERR_INVALID_ARG;
     }
-    void *ptr = env->GetDirectBufferAddress(dst);
+    void *pixels = env->GetDirectBufferAddress(dst);
     jlong cap = env->GetDirectBufferCapacity(dst);
-    if (!ptr || cap <= 0 || (int64_t)stride > cap) {
+    if (!pixels || cap <= 0 || (int64_t)stride > cap) {
         return CG_ERR_INVALID_ARG;
     }
-    uint64_t qpc = 0;
-    int32_t rc =
-        cg_dxgi_acquire(h, ptr, (int32_t)stride, (int32_t)cap, (int)timeoutMs, &qpc);
-    if (rc == CG_OK && qpcOut) {
-        jlong v = (jlong)qpc;
-        env->SetLongArrayRegion(qpcOut, 0, 1, &v);
+
+    CgMove *moveBuf = nullptr;
+    if (moves) {
+        moveBuf = (CgMove *)env->GetDirectBufferAddress(moves);
+    }
+    CgRect *dirtyBuf = nullptr;
+    if (dirties) {
+        dirtyBuf = (CgRect *)env->GetDirectBufferAddress(dirties);
+    }
+    void *shapeBuf = nullptr;
+    jlong shapeCap = 0;
+    if (shape) {
+        shapeBuf = env->GetDirectBufferAddress(shape);
+        shapeCap = env->GetDirectBufferCapacity(shape);
+    }
+
+    CgAcquireOut o = {};
+    o.moves = moveBuf;
+    o.dirty = dirtyBuf;
+    o.ptrShape = shapeBuf;
+    o.ptrShapeCap = (int32_t)(shapeCap > 0x7fffffff ? 0x7fffffff : shapeCap);
+
+    int32_t rc = cg_dxgi_acquire_full(h, pixels, (int32_t)stride, (int32_t)cap, (int)timeoutMs, &o);
+    if (rc != CG_OK) {
+        return rc;
+    }
+    if (qpc) {
+        jlong v = (jlong)o.qpc;
+        env->SetLongArrayRegion(qpc, 0, 1, &v);
+    }
+    if (meta) {
+        jint v[4] = {o.width, o.height, o.moveCount, o.dirtyCount};
+        env->SetIntArrayRegion(meta, 0, 4, v);
+    }
+    if (ptr) {
+        jint v[9] = {o.ptrVisible, o.ptrX, o.ptrY, o.ptrW, o.ptrH,
+                     o.ptrHotX, o.ptrHotY, o.ptrType, o.ptrShapeSize};
+        env->SetIntArrayRegion(ptr, 0, 9, v);
     }
     return rc;
 }

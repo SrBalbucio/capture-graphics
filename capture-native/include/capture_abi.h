@@ -1,4 +1,4 @@
-// capture_abi.h — Minimal stable C ABI for the DXGI Desktop Duplication backend.
+// capture_abi.h — Stable C ABI for the DXGI Desktop Duplication backend (Phase 2).
 //
 // Design: COM/D3D11 details never cross this boundary. Java owns pooled direct
 // buffers; native code copies staging -> Java buffer row by row (1 copy total,
@@ -6,6 +6,9 @@
 //
 // Threading: a CgHandle is NOT thread-safe. The Java session serializes all calls.
 // Status codes: 0 = ok, 1 = timeout (no new frame), <0 = fatal, reopen required.
+//
+// NOTE: pre-1.0 the acquire entry point was extended in place (rects + pointer
+// outputs). Consumers must match this header, not the Phase-1 one.
 #pragma once
 
 #include <stdint.h>
@@ -33,6 +36,56 @@ typedef struct {
     int32_t stride; // bytes per row in the Java-side buffer (width * 4)
 } CgInfo;
 
+// Output enumeration (no open handle required).
+typedef struct {
+    int32_t x, y;          // origin in desktop coordinates
+    int32_t width, height; // size in pixels
+    int32_t hdr;           // 0 = SDR, 1 = HDR colorspace reported
+} CgOutputDesc;
+
+// Dirty region, output-relative (0,0 = top-left of this output).
+typedef struct {
+    int32_t x, y, width, height;
+} CgRect;
+
+// Move region: pixels copied from src to dst by the compositor.
+typedef struct {
+    int32_t srcX, srcY, dstX, dstY, width, height;
+} CgMove;
+
+// Fixed caps: DXGI rarely reports more; counts are capped, never overflowed.
+enum {
+    CG_MAX_MOVES = 128,
+    CG_MAX_DIRTY = 128,
+    CG_PTR_SHAPE_CAP = 262144 // 256 KiB: enough for any 256x256x32bpp cursor
+};
+
+// Pointer shape types (subset of DXGI_OUTDUPL_POINTER_SHAPE_TYPE).
+enum {
+    CG_PTR_NONE = 0,
+    CG_PTR_MONO = 1,   // 1bpp AND mask over 1bpp XOR mask, height = h/2 each
+    CG_PTR_COLOR = 2,  // 32-bit ARGB, straight alpha
+    CG_PTR_MASKED = 3  // 32-bit color + 1bpp mask (legacy; Java falls back to color)
+};
+
+// Output of cg_dxgi_acquire_full. All buffers are caller-owned; native code only
+// writes up to the given caps and reports (possibly capped) counts.
+typedef struct {
+    uint64_t qpc; // QPC timestamp of the acquired frame
+    int32_t width, height;
+    int32_t moveCount; // valid entries in moves (capped at CG_MAX_MOVES)
+    CgMove *moves;
+    int32_t dirtyCount; // valid entries in dirty (capped at CG_MAX_DIRTY)
+    CgRect *dirty;
+    // Pointer state for this frame (output-relative position, hotspot-excluded).
+    int32_t ptrVisible; // 0/1: a shape is currently cached
+    int32_t ptrX, ptrY; // cursor position, output-relative
+    int32_t ptrW, ptrH, ptrHotX, ptrHotY, ptrType;
+    void *ptrShape;         // caller buffer, receives cached shape when visible
+    int32_t ptrShapeCap;    // capacity of ptrShape in bytes
+    int32_t ptrShapeSize;   // bytes written (0 when not visible)
+} CgAcquireOut;
+
 enum {
     CG_OK = 0,
     CG_TIMEOUT = 1,
@@ -45,12 +98,13 @@ enum {
 
 CG_API int32_t cg_dxgi_open(int adapter, int output, CgHandle *out);
 CG_API int32_t cg_dxgi_info(CgHandle h, CgInfo *out);
+CG_API int32_t cg_dxgi_output_count(int adapter, int32_t *out);
+CG_API int32_t cg_dxgi_output_desc(int adapter, int output, CgOutputDesc *out);
 
-// Copies the next desktop frame into `dst` (capacity `dstCap` bytes, row stride
-// `dstStride` bytes). On success writes the QPC timestamp to `qpcOut`.
-// Returns CG_OK, CG_TIMEOUT, or a negative error.
-CG_API int32_t cg_dxgi_acquire(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap,
-                               int timeoutMs, uint64_t *qpcOut);
+// Full acquisition: frame copy + dirty/move rects + pointer state, in one call.
+// Rect/shape buffers may be NULL (with count 0) to skip those outputs.
+CG_API int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap,
+                                    int timeoutMs, CgAcquireOut *out);
 CG_API int64_t cg_qpc_frequency(void);
 CG_API const char *cg_dxgi_last_error(CgHandle h);
 CG_API void cg_dxgi_close(CgHandle h);
