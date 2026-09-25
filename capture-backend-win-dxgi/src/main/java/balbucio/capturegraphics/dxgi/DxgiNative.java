@@ -49,9 +49,9 @@ final class DxgiNative {
     /** Fills {@code out} with {x,y,width,height,hdr}; returns status. */
     static native int nOutputDesc(int adapter, int output, int[] out);
 
-    static native int nAcquire(long handle, ByteBuffer dst, int stride, int timeoutMs,
-                               long[] qpc, int[] meta, ByteBuffer moves, ByteBuffer dirties,
-                               int[] ptr, ByteBuffer shape);
+    static native int nAcquire(long handle, ByteBuffer dst, int stride, int srcX, int srcY,
+                               int timeoutMs, long[] qpc, int[] meta, ByteBuffer moves,
+                               ByteBuffer dirties, int[] ptr, ByteBuffer shape);
 
     static native int nGpuInit(long handle, int slots);
 

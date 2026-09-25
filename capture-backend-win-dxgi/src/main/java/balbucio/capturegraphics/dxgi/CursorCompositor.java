@@ -14,12 +14,15 @@ final class CursorCompositor {
 
     /**
      * @param frame  BGRA frame buffer (position/limit ignored, absolute access)
-     * @param ptr    {@code DxgiNative} ptr[] layout (9 ints)
+     * @param ox     horizontal offset of the frame origin in output coordinates
+     *               (region capture; 0 for full-frame)
+     * @param oy     vertical offset of the frame origin in output coordinates
+     * @param ptr    {@code DxgiNative} ptr[] layout (9 ints, output-relative position)
      * @param shape  cached shape bytes, little-endian (must be a {@code LITTLE_ENDIAN} buffer,
      *               matching the native x86 writer; multi-byte reads depend on it)
      */
     static void composite(ByteBuffer frame, int frameW, int frameH, int stride,
-                          int[] ptr, ByteBuffer shape) {
+                          int ox, int oy, int[] ptr, ByteBuffer shape) {
         if (ptr[DxgiNative.PTR_VISIBLE] == 0) {
             return;
         }
@@ -28,8 +31,8 @@ final class CursorCompositor {
         if (w <= 0 || h <= 0 || w > 512 || h > 512) {
             return;
         }
-        int left = ptr[DxgiNative.PTR_X] - ptr[DxgiNative.PTR_HOT_X];
-        int top = ptr[DxgiNative.PTR_Y] - ptr[DxgiNative.PTR_HOT_Y];
+        int left = ptr[DxgiNative.PTR_X] - ptr[DxgiNative.PTR_HOT_X] - ox;
+        int top = ptr[DxgiNative.PTR_Y] - ptr[DxgiNative.PTR_HOT_Y] - oy;
         if (left >= frameW || top >= frameH || left + w <= 0 || top + h <= 0) {
             return; // fully off-output
         }

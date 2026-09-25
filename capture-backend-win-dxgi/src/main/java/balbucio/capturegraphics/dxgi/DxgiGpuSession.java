@@ -122,7 +122,7 @@ final class DxgiGpuSession implements GpuCaptureSession {
         lastQpc = qpc;
         long s = seq.getAndIncrement();
         FrameMeta fm = new FrameMeta(s, pts, durationNanos, display, dropped,
-                DxgiBackend.unionDirty(meta, moves, dirties, (int) g[4], (int) g[5]), true);
+                DxgiBackend.unionDirty(meta, moves, dirties, 0, 0, (int) g[4], (int) g[5]), true);
         outstanding.incrementAndGet();
         DxgiGpuFrame frame = new DxgiGpuFrame(handle, (int) g[0], g[1], g[2], g[3],
                 (int) g[4], (int) g[5], fm);
@@ -207,8 +207,8 @@ final class DxgiGpuSession implements GpuCaptureSession {
             try {
                 next = DxgiBackend.openHandle(output);
             } catch (CaptureException e) {
-                LOG.log(Logger.Level.WARNING, "DXGI GPU reopen attempt {0} failed: {1}",
-                        attempt + 1, e.getMessage());
+                LOG.log(Logger.Level.WARNING, "DXGI GPU reopen attempt " + (attempt + 1)
+                        + " failed: " + e.getMessage());
                 continue;
             }
             int slots = Math.min(16, Math.max(2, config.framePoolSize()));
@@ -238,7 +238,7 @@ final class DxgiGpuSession implements GpuCaptureSession {
             baseQpc = 0;
             lastQpc = 0;
             baseNano = System.nanoTime();
-            LOG.log(Logger.Level.INFO, "DXGI GPU session reopened on output {0}", output);
+            LOG.log(Logger.Level.INFO, "DXGI GPU session reopened on output " + output);
             return true;
         }
         return false;

@@ -8,6 +8,7 @@ import balbucio.capturegraphics.api.CaptureException;
 import balbucio.capturegraphics.api.CaptureSession;
 import balbucio.capturegraphics.api.DisplayId;
 import balbucio.capturegraphics.api.FrameFormat;
+import balbucio.capturegraphics.api.Frame;
 import balbucio.capturegraphics.api.FrameListener;
 import balbucio.capturegraphics.api.FrameMeta;
 import balbucio.capturegraphics.api.GpuCaptureSession;
@@ -15,6 +16,7 @@ import balbucio.capturegraphics.api.Rect;
 import balbucio.capturegraphics.api.SessionMetrics;
 import balbucio.capturegraphics.core.FramePool;
 import balbucio.capturegraphics.core.MetricsTracker;
+import balbucio.capturegraphics.core.RetainedLatest;
 
 import java.lang.System.Logger;
 import java.nio.ByteBuffer;
@@ -127,11 +129,42 @@ public final class DxgiBackend implements CaptureBackend {
             throw new CaptureException(CaptureException.Reason.NATIVE_ERROR, "QPC unavailable");
         }
         DisplayId resolved = resolveDisplay(output, info[0], info[1]);
-        FramePool pool = new FramePool(info[0], info[1], FrameFormat.BGRA_8,
+        Rect region = clipRegion(config.region(), resolved);
+        if (region == null) {
+            DxgiNative.nClose(handle);
+            throw new CaptureException(CaptureException.Reason.INVALID_ARG,
+                    "Region lies completely outside the display");
+        }
+        FramePool pool = new FramePool(region.width(), region.height(), FrameFormat.BGRA_8,
                 Math.max(2, config.framePoolSize()));
-        LOG.log(Logger.Level.INFO, "DXGI backend opened output {0} {1}x{2}{3}",
-                output, info[0], info[1], config.cursor() ? " +cursor" : "");
-        return new DxgiSession(handle, output, resolved, config, pool, freq);
+        LOG.log(Logger.Level.INFO, "DXGI backend opened output " + output + " "
+                + info[0] + "x" + info[1] + regionSuffix(region, resolved)
+                + (config.cursor() ? " +cursor" : ""));
+        return new DxgiSession(handle, output, resolved, region, config, pool, freq);
+    }
+
+    /** Clips a requested region to the display (display coordinates); null when disjoint. */
+    static Rect clipRegion(Rect requested, DisplayId display) {
+        if (requested == null) {
+            return new Rect(display.x(), display.y(), display.width(), display.height());
+        }
+        int x0 = Math.max(display.x(), requested.x());
+        int y0 = Math.max(display.y(), requested.y());
+        int x1 = Math.min(display.x() + display.width(), requested.x() + requested.width());
+        int y1 = Math.min(display.y() + display.height(), requested.y() + requested.height());
+        if (x1 <= x0 || y1 <= y0) {
+            return null;
+        }
+        return new Rect(x0, y0, x1 - x0, y1 - y0);
+    }
+
+    private static String regionSuffix(Rect region, DisplayId display) {
+        if (region.x() == display.x() && region.y() == display.y()
+                && region.width() == display.width() && region.height() == display.height()) {
+            return "";
+        }
+        return " region=" + region.x() + "," + region.y() + " "
+                + region.width() + "x" + region.height();
     }
 
     @Override
@@ -178,8 +211,8 @@ public final class DxgiBackend implements CaptureBackend {
                     "GPU pool init failed (need Windows 10 1703+): " + detail);
         }
         DisplayId resolved = resolveDisplay(output, info[0], info[1]);
-        LOG.log(Logger.Level.INFO, "DXGI GPU backend opened output {0} {1}x{2} slots={3}",
-                output, info[0], info[1], slots);
+        LOG.log(Logger.Level.INFO, "DXGI GPU backend opened output " + output + " " + info[0]
+                + "x" + info[1] + " slots=" + slots);
         return new DxgiGpuSession(handle, output, resolved, config, freq);
     }
 
@@ -209,6 +242,9 @@ public final class DxgiBackend implements CaptureBackend {
         private long handle;
         private final int output;
         private DisplayId display;
+        private Rect region;
+        private int srcX;
+        private int srcY;
         private final CaptureConfig config;
         private FramePool pool;
         private int stride;
@@ -216,6 +252,7 @@ public final class DxgiBackend implements CaptureBackend {
         private final AtomicLong seq = new AtomicLong(0);
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private final AtomicReference<PushLoop> push = new AtomicReference<>();
+        private final RetainedLatest retained = new RetainedLatest();
         private final long qpcFreq;
         private final long durationNanos;
         // Reused native call buffers: zero allocation per frame.
@@ -229,14 +266,15 @@ public final class DxgiBackend implements CaptureBackend {
         private long baseNano = 0;
         private long lastQpc = 0;
 
-        DxgiSession(long handle, int output, DisplayId display, CaptureConfig config,
+        DxgiSession(long handle, int output, DisplayId display, Rect region, CaptureConfig config,
                     FramePool pool, long qpcFreq) {
             this.handle = handle;
             this.output = output;
             this.display = display;
+            setRegion(region);
             this.config = config;
             this.pool = pool;
-            this.stride = display.width() * 4;
+            this.stride = region.width() * 4;
             this.qpcFreq = qpcFreq;
             this.durationNanos = config.targetFps() > 0
                     ? 1_000_000_000L / config.targetFps() : 16_666_666L;
@@ -248,6 +286,13 @@ public final class DxgiBackend implements CaptureBackend {
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN);
         }
 
+        /** Region is display coordinates; native offsets are output-relative. */
+        private void setRegion(Rect region) {
+            this.region = region;
+            this.srcX = region.x() - display.x();
+            this.srcY = region.y() - display.y();
+        }
+
         @Override
         public synchronized FramePool.PooledFrame acquire() throws CaptureException {
             if (closed.get()) {
@@ -255,8 +300,8 @@ public final class DxgiBackend implements CaptureBackend {
             }
             long t0 = System.nanoTime();
             var frame = pool.take();
-            int rc = DxgiNative.nAcquire(handle, frame.writable(), stride, config.timeoutMs(),
-                    qpcOut, meta, moves, dirties, ptr, shape);
+            int rc = DxgiNative.nAcquire(handle, frame.writable(), stride, srcX, srcY,
+                    config.timeoutMs(), qpcOut, meta, moves, dirties, ptr, shape);
             if (rc == DxgiNative.CG_TIMEOUT) {
                 frame.close();
                 return null;
@@ -283,8 +328,8 @@ public final class DxgiBackend implements CaptureBackend {
 
         private FramePool.PooledFrame acquireAfterReopen(long t0) throws CaptureException {
             var frame = pool.take();
-            int rc = DxgiNative.nAcquire(handle, frame.writable(), stride, config.timeoutMs(),
-                    qpcOut, meta, moves, dirties, ptr, shape);
+            int rc = DxgiNative.nAcquire(handle, frame.writable(), stride, srcX, srcY,
+                    config.timeoutMs(), qpcOut, meta, moves, dirties, ptr, shape);
             if (rc == DxgiNative.CG_TIMEOUT) {
                 frame.close();
                 return null;
@@ -314,10 +359,14 @@ public final class DxgiBackend implements CaptureBackend {
             lastQpc = qpc;
             long s = seq.getAndIncrement();
             frame.withMeta(new FrameMeta(s, pts, durationNanos, display, dropped,
-                    unionDirty(meta, moves, dirties, display.width(), display.height()), true));
+                    unionDirty(meta, moves, dirties, srcX, srcY, region.width(), region.height()),
+                    true));
             if (config.cursor() && ptr[DxgiNative.PTR_VISIBLE] != 0) {
-                CursorCompositor.composite(buf, display.width(), display.height(), stride, ptr, shape);
+                CursorCompositor.composite(buf, region.width(), region.height(), stride,
+                        srcX, srcY, ptr, shape);
             }
+            retained.offer(config.retainLast(), buf, region.width(), region.height(), stride,
+                    frame.meta());
             metrics.onDelivered(System.nanoTime() - t0, dropped);
             return frame;
         }
@@ -343,8 +392,7 @@ public final class DxgiBackend implements CaptureBackend {
                 try {
                     next = openHandle(output);
                 } catch (CaptureException e) {
-                    LOG.log(Logger.Level.WARNING, "DXGI reopen attempt {0} failed: {1}",
-                            attempt + 1, e.getMessage());
+                    LOG.log(Logger.Level.WARNING, "DXGI reopen attempt " + (attempt + 1) + " failed: " + e.getMessage());
                     continue;
                 }
                 int[] info = DxgiNative.nInfo(next);
@@ -363,16 +411,30 @@ public final class DxgiBackend implements CaptureBackend {
                     DxgiNative.nClose(next);
                     continue;
                 }
+                DisplayId nextDisplay = resolveDisplay(output, w, h);
+                Rect nextRegion = clipRegion(config.region(), nextDisplay);
+                if (nextRegion == null) {
+                    // New mode no longer intersects the requested region: drop the
+                    // candidate and keep the old handle so the caller gets a clean
+                    // MODE_CHANGED instead of a wrong-sized frame.
+                    DxgiNative.nClose(next);
+                    LOG.log(Logger.Level.WARNING,
+                            "DXGI reopen: region outside new mode, giving up");
+                    return false;
+                }
                 DxgiNative.nClose(handle);
                 handle = next;
                 if (w != display.width() || h != display.height()) {
-                    pool = new FramePool(w, h, FrameFormat.BGRA_8,
-                            Math.max(2, config.framePoolSize()));
-                    stride = w * 4;
-                    display = resolveDisplay(output, w, h);
-                    LOG.log(Logger.Level.INFO, "DXGI reopened with new geometry {0}x{1}", w, h);
+                    pool = new FramePool(nextRegion.width(), nextRegion.height(),
+                            FrameFormat.BGRA_8, Math.max(2, config.framePoolSize()));
+                    display = nextDisplay;
+                    setRegion(nextRegion);
+                    stride = nextRegion.width() * 4;
+                    LOG.log(Logger.Level.INFO, "DXGI reopened with new geometry " + w + "x" + h);
                 } else {
-                    LOG.log(Logger.Level.INFO, "DXGI reopened on output {0}", output);
+                    display = nextDisplay;
+                    setRegion(nextRegion);
+                    LOG.log(Logger.Level.INFO, "DXGI reopened on output " + output);
                 }
                 baseQpc = 0; // re-anchor below; pts continues from wall clock
                 lastQpc = 0;
@@ -392,6 +454,11 @@ public final class DxgiBackend implements CaptureBackend {
                 default -> new CaptureException(CaptureException.Reason.NATIVE_ERROR,
                         "DXGI acquire failed rc=" + rc + ": " + detail);
             };
+        }
+
+        @Override
+        public java.util.Optional<Frame> latest() {
+            return retained.view();
         }
 
         @Override
@@ -476,7 +543,7 @@ public final class DxgiBackend implements CaptureBackend {
                         }
                     } catch (CaptureException e) {
                         if (running && e.reason() != CaptureException.Reason.CLOSED) {
-                            LOG.log(Logger.Level.WARNING, "DXGI acquire failed: {0}", e.getMessage());
+                            LOG.log(Logger.Level.WARNING, "DXGI acquire failed: " + e.getMessage());
                         }
                         return; // reopen is handled inside acquire; reaching here is fatal
                     }
@@ -487,21 +554,23 @@ public final class DxgiBackend implements CaptureBackend {
 
     /**
      * Merges move destinations + dirty rects (both output-relative) into the changed-region
-     * list for encoders. Clipped to the frame; falls back to full-frame when DXGI reports
-     * no regions for an acquired frame.
+     * list for encoders, translated by {@code (-ox,-oy)} into frame coordinates and clipped
+     * to the frame; falls back to full-frame when DXGI reports no regions for an acquired
+     * frame.
      */
-    static List<Rect> unionDirty(int[] meta, ByteBuffer moves, ByteBuffer dirties, int w, int h) {
+    static List<Rect> unionDirty(int[] meta, ByteBuffer moves, ByteBuffer dirties,
+                                 int ox, int oy, int w, int h) {
         List<Rect> out = new ArrayList<>();
         int moveCount = Math.min(meta[2], MAX_CAP);
         for (int i = 0; i < moveCount; i++) {
             int base = i * 6 * 4;
-            addClipped(out, moves.getInt(base + 2 * 4), moves.getInt(base + 3 * 4),
+            addClipped(out, moves.getInt(base + 2 * 4) - ox, moves.getInt(base + 3 * 4) - oy,
                     moves.getInt(base + 4 * 4), moves.getInt(base + 5 * 4), w, h);
         }
         int dirtyCount = Math.min(meta[3], MAX_CAP);
         for (int i = 0; i < dirtyCount; i++) {
             int base = i * 4 * 4;
-            addClipped(out, dirties.getInt(base), dirties.getInt(base + 4),
+            addClipped(out, dirties.getInt(base) - ox, dirties.getInt(base + 4) - oy,
                     dirties.getInt(base + 8), dirties.getInt(base + 12), w, h);
         }
         if (out.isEmpty()) {

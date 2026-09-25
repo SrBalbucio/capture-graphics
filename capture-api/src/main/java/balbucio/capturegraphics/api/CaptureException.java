@@ -9,6 +9,7 @@ public class CaptureException extends Exception {
         ACCESS_DENIED,
         UNSUPPORTED_FORMAT,
         UNSUPPORTED_OPERATION,
+        INVALID_ARG,
         CLOSED,
         NATIVE_ERROR
     }

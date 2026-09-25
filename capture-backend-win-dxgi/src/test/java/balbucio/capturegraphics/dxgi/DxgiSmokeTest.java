@@ -87,4 +87,74 @@ class DxgiSmokeTest {
         assertFalse(displays.isEmpty());
         assertTrue(displays.get(0).width() > 0);
     }
+
+    @Test
+    void acquireRegion() throws Exception {
+        assumeTrue(NativeLibLoader.isWindowsX64(), "requires Windows x64");
+        var backend = new DxgiBackend();
+        var display = backend.displays().get(0);
+        var region = new balbucio.capturegraphics.api.Rect(
+                display.x() + 10, display.y() + 10, 320, 200);
+        var config = CaptureConfig.builder().timeoutMs(100).targetFps(60).region(region).build();
+        try (var session = backend.open(config)) {
+            int got = 0;
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (got < 5 && System.currentTimeMillis() < deadline) {
+                try (var f = session.acquire()) {
+                    if (f == null) {
+                        continue;
+                    }
+                    assertEquals(320, f.width());
+                    assertEquals(200, f.height());
+                    assertEquals(320 * 200 * 4, f.data().remaining());
+                    for (var r : f.meta().dirty()) {
+                        assertTrue(r.x() >= 0 && r.y() >= 0);
+                        assertTrue(r.x() + r.width() <= 320);
+                        assertTrue(r.y() + r.height() <= 200);
+                    }
+                    got++;
+                }
+            }
+            assertTrue(got >= 3, "expected region frames, got " + got);
+        } catch (CaptureException e) {
+            assumeTrue(false, "DXGI unavailable: " + e.reason() + " " + e.getMessage());
+        }
+    }
+
+    @Test
+    void latestRetained() throws Exception {
+        assumeTrue(NativeLibLoader.isWindowsX64(), "requires Windows x64");
+        var config = CaptureConfig.builder().timeoutMs(100).retainLast(true).build();
+        try (var session = new DxgiBackend().open(config)) {
+            assertTrue(session.latest().isEmpty(), "nothing delivered yet");
+            long deadline = System.currentTimeMillis() + 15_000;
+            long seq = -1;
+            while (seq < 0 && System.currentTimeMillis() < deadline) {
+                try (var f = session.acquire()) {
+                    if (f != null) {
+                        seq = f.meta().sequence();
+                    }
+                }
+            }
+            var latest = assertDoesNotThrow(() -> session.latest());
+            assertTrue(latest.isPresent());
+            assertEquals(seq, latest.get().meta().sequence());
+            assertDoesNotThrow(() -> latest.get().close()); // no-op, session-owned
+        } catch (CaptureException e) {
+            assumeTrue(false, "DXGI unavailable: " + e.reason() + " " + e.getMessage());
+        }
+    }
+
+    @Test
+    void latestEmptyByDefault() throws Exception {
+        assumeTrue(NativeLibLoader.isWindowsX64(), "requires Windows x64");
+        try (var session = new DxgiBackend().open(CaptureConfig.bgra())) {
+            try (var f = session.acquire()) {
+                // may be null on timeout; latest must stay empty regardless
+            }
+            assertTrue(session.latest().isEmpty());
+        } catch (CaptureException e) {
+            assumeTrue(false, "DXGI unavailable: " + e.reason() + " " + e.getMessage());
+        }
+    }
 }

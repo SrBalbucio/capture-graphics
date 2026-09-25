@@ -124,7 +124,11 @@ CG_API int32_t cg_dxgi_output_desc(int adapter, int output, CgOutputDesc *out);
 
 // Full acquisition: frame copy + dirty/move rects + pointer state, in one call.
 // Rect/shape buffers may be NULL (with count 0) to skip those outputs.
+// srcX/srcY select a sub-rectangle of the staged frame to copy (region capture):
+// only those rows/columns are read, pixels outside are never touched. copyW/H
+// derive from dstStride/dstCap, clamped to the frame.
 CG_API int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap,
+                                    int srcX, int srcY,
                                     int timeoutMs, CgAcquireOut *out);
 // Initializes the GPU shared-texture pool (idempotent; grows never, fixed count).
 // Requires ID3D11Fence support (Windows 10 1703+); else CG_ERR_OPEN.

@@ -16,6 +16,16 @@ public interface CaptureSession extends AutoCloseable {
     /** Acquire next frame or {@code null} on timeout. Caller owns the frame and must close it. */
     Frame acquire() throws CaptureException;
 
+    /**
+     * The last delivered frame, if {@link CaptureConfig#retainLast()} is enabled.
+     * Session-owned: valid until the next delivered frame (or close), must NOT be
+     * closed by the caller — snapshot its bytes if a longer lifetime is needed.
+     * Default: empty (backends opt in; GPU sessions never retain).
+     */
+    default java.util.Optional<Frame> latest() {
+        return java.util.Optional.empty();
+    }
+
     /** Subscribe a push listener. Only one listener per session in MVP. */
     void onFrame(FrameListener listener, Backpressure backpressure);
 

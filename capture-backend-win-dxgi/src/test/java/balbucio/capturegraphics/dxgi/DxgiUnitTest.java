@@ -35,7 +35,7 @@ class DxgiUnitTest {
         dirties.putInt(0, 0).putInt(4, 0).putInt(8, 100).putInt(12, 100);
         dirties.putInt(16, 1900).putInt(20, 1000).putInt(24, 200).putInt(28, 200);
         int[] meta = {1920, 1080, 1, 2};
-        List<Rect> rects = DxgiBackend.unionDirty(meta, moves, dirties, 1920, 1080);
+        List<Rect> rects = DxgiBackend.unionDirty(meta, moves, dirties, 0, 0, 1920, 1080);
         assertEquals(3, rects.size());
         assertEquals(new Rect(10, 10, 50, 50), rects.get(0));
         assertEquals(new Rect(0, 0, 100, 100), rects.get(1));
@@ -46,7 +46,7 @@ class DxgiUnitTest {
     void unionDirtyFallsBackToFullFrame() {
         ByteBuffer moves = le(128 * 6 * 4);
         ByteBuffer dirties = le(128 * 4 * 4);
-        List<Rect> rects = DxgiBackend.unionDirty(new int[]{64, 64, 0, 0}, moves, dirties, 64, 64);
+        List<Rect> rects = DxgiBackend.unionDirty(new int[]{64, 64, 0, 0}, moves, dirties, 0, 0, 64, 64);
         assertEquals(List.of(Rect.full(64, 64)), rects);
     }
 
@@ -57,7 +57,7 @@ class DxgiUnitTest {
         ByteBuffer shape = le(256);
         shape.putInt(0, 0xFFFF0000); // opaque red ARGB at cursor (0,0)
         int[] ptr = {1, 4, 4, 1, 1, 0, 0, DxgiNative.PTR_COLOR, 4};
-        CursorCompositor.composite(frame, w, h, stride, ptr, shape);
+        CursorCompositor.composite(frame, w, h, stride, 0, 0, ptr, shape);
         int di = 4 * stride + 4 * 4;
         assertEquals((byte) 0x00, frame.get(di));     // B
         assertEquals((byte) 0x00, frame.get(di + 1)); // G
@@ -72,7 +72,7 @@ class DxgiUnitTest {
         ByteBuffer frame = le(64);
         ByteBuffer shape = le(64);
         int[] ptr = {0, 0, 0, 2, 2, 0, 0, DxgiNative.PTR_COLOR, 16};
-        CursorCompositor.composite(frame, 4, 4, 16, ptr, shape);
+        CursorCompositor.composite(frame, 4, 4, 16, 0, 0, ptr, shape);
         for (int i = 0; i < 64; i++) {
             assertEquals(0, frame.get(i));
         }

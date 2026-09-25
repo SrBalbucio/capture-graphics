@@ -547,7 +547,7 @@ static int32_t acquireTexture(CgContext *h, int timeoutMs, ID3D11Texture2D **fra
 // --- Full acquisition ----------------------------------------------------------
 
 int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap,
-                             int timeoutMs, CgAcquireOut *out) {
+                             int srcX, int srcY, int timeoutMs, CgAcquireOut *out) {
     if (!h || !dst || !out || dstStride <= 0 || dstCap <= 0) {
         return CG_ERR_INVALID_ARG;
     }
@@ -575,19 +575,42 @@ int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t d
     }
 
     int32_t rc = CG_OK;
-    if ((int64_t)dstStride * (int64_t)bh > (int64_t)dstCap) {
-        setError(h, "destination buffer too small");
+    // Region copy: rows/columns outside [srcX,srcY)+dst are never read.
+    int copyW = dstStride / 4;
+    int copyH = dstStride > 0 ? dstCap / dstStride : 0;
+    if (srcX < 0 || srcY < 0 || copyW <= 0 || copyH <= 0 || srcX >= w || srcY >= bh) {
+        setError(h, "region out of frame bounds");
         frame->Release();
         h->dupl->ReleaseFrame();
         return CG_ERR_INVALID_ARG;
     }
-    if (!ensureStaging(h, w, bh)) {
+    if (srcX + copyW > w) {
+        copyW = w - srcX;
+    }
+    if (srcY + copyH > bh) {
+        copyH = bh - srcY;
+    }
+    if ((int64_t)copyW * 4 > (int64_t)dstStride || (int64_t)dstStride * (int64_t)copyH > (int64_t)dstCap) {
+        setError(h, "destination buffer too small for region");
+        frame->Release();
+        h->dupl->ReleaseFrame();
+        return CG_ERR_INVALID_ARG;
+    }
+    if (!ensureStaging(h, copyW, copyH)) {
         frame->Release();
         h->dupl->ReleaseFrame();
         return CG_ERR_COPY;
     }
 
-    h->ctx->CopyResource(h->staging, frame);
+    // GPU-side crop: only the region travels the bus into the staging texture.
+    D3D11_BOX box = {};
+    box.left = (UINT)srcX;
+    box.top = (UINT)srcY;
+    box.front = 0;
+    box.right = (UINT)(srcX + copyW);
+    box.bottom = (UINT)(srcY + copyH);
+    box.back = 1;
+    h->ctx->CopySubresourceRegion(h->staging, 0, 0, 0, 0, frame, 0, &box);
     frame->Release();
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -599,9 +622,9 @@ int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t d
     }
     const uint8_t *src = (const uint8_t *)mapped.pData;
     uint8_t *d = (uint8_t *)dst;
-    int rowBytes = w * 4;
+    int rowBytes = copyW * 4;
     int copyBytes = rowBytes < dstStride ? rowBytes : dstStride;
-    for (int y = 0; y < bh; y++) {
+    for (int y = 0; y < copyH; y++) {
         memcpy(d + (size_t)y * (size_t)dstStride, src + (size_t)y * (size_t)mapped.RowPitch,
                (size_t)copyBytes);
     }
@@ -1010,7 +1033,8 @@ JNIEXPORT jint JNICALL JNI_FN(nOutputDesc)(JNIEnv *env, jclass CG_UNUSED cls, ji
 }
 
 JNIEXPORT jint JNICALL JNI_FN(nAcquire)(JNIEnv *env, jclass CG_UNUSED cls, jlong handle,
-                                        jobject dst, jint stride, jint timeoutMs, jlongArray qpc,
+                                        jobject dst, jint stride, jint srcX, jint srcY,
+                                        jint timeoutMs, jlongArray qpc,
                                         jintArray meta, jobject moves, jobject dirties, jintArray ptr,
                                         jobject shape) {
     CgHandle h = (CgHandle)(intptr_t)handle;
@@ -1044,7 +1068,8 @@ JNIEXPORT jint JNICALL JNI_FN(nAcquire)(JNIEnv *env, jclass CG_UNUSED cls, jlong
     o.ptrShape = shapeBuf;
     o.ptrShapeCap = (int32_t)(shapeCap > 0x7fffffff ? 0x7fffffff : shapeCap);
 
-    int32_t rc = cg_dxgi_acquire_full(h, pixels, (int32_t)stride, (int32_t)cap, (int)timeoutMs, &o);
+    int32_t rc = cg_dxgi_acquire_full(h, pixels, (int32_t)stride, (int32_t)cap,
+                                      (int)srcX, (int)srcY, (int)timeoutMs, &o);
     if (rc != CG_OK) {
         return rc;
     }

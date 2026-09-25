@@ -8,6 +8,8 @@ public final class CaptureConfig {
     private final int framePoolSize;
     private final long targetFps;
     private final boolean cursor;
+    private final Rect region;
+    private final boolean retainLast;
 
     private CaptureConfig(Builder b) {
         this.display = b.display;
@@ -16,6 +18,8 @@ public final class CaptureConfig {
         this.framePoolSize = b.framePoolSize;
         this.targetFps = b.targetFps;
         this.cursor = b.cursor;
+        this.region = b.region;
+        this.retainLast = b.retainLast;
     }
 
     public DisplayId display() {
@@ -43,6 +47,25 @@ public final class CaptureConfig {
         return cursor;
     }
 
+    /**
+     * Sub-rectangle of the display to capture, in display coordinates, or {@code null}
+     * for full-frame. Backends that can crop natively (win-dxgi) skip the memcpy of
+     * outside pixels entirely; others capture full-frame and crop on delivery.
+     * Delivered frames are always sized to the (clipped) region.
+     */
+    public Rect region() {
+        return region;
+    }
+
+    /**
+     * Whether the session keeps the last delivered frame available via
+     * {@link CaptureSession#latest()}. Costs one extra buffer copy per frame;
+     * off by default. Useful for polling UIs that must always show something.
+     */
+    public boolean retainLast() {
+        return retainLast;
+    }
+
     /** BGRA 60fps, 16ms timeout, pool sized for ~150ms of buffering. */
     public static CaptureConfig bgra() {
         return builder().build();
@@ -59,6 +82,8 @@ public final class CaptureConfig {
         private int framePoolSize = 11; // ceil(60 * 0.15) + 2
         private long targetFps = 60;
         private boolean cursor = false;
+        private Rect region;
+        private boolean retainLast = false;
 
         public Builder display(DisplayId d) {
             this.display = d;
@@ -87,6 +112,16 @@ public final class CaptureConfig {
 
         public Builder cursor(boolean enabled) {
             this.cursor = enabled;
+            return this;
+        }
+
+        public Builder region(Rect region) {
+            this.region = region;
+            return this;
+        }
+
+        public Builder retainLast(boolean enabled) {
+            this.retainLast = enabled;
             return this;
         }
 
