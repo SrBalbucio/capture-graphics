@@ -1,4 +1,8 @@
 target/
+capture-native/build/
+*.obj
+*.lib
+*.exp
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
