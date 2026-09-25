@@ -17,6 +17,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <dxgi1_6.h>
 
@@ -30,6 +31,13 @@
 #else
 #define CG_UNUSED
 #endif
+
+struct CgGpuSlot {
+    ID3D11Texture2D *tex = nullptr;
+    HANDLE shared = nullptr; // NT handle value (owned by the texture)
+    IDXGIKeyedMutex *km = nullptr; // exclusive-access protocol (see acquire_gpu)
+    bool busy = false;
+};
 
 struct CgContext {
     ID3D11Device *device = nullptr;
@@ -46,6 +54,15 @@ struct CgContext {
     uint8_t *ptrShape = nullptr;
     int32_t ptrShapeSize = 0;
     int32_t ptrW = 0, ptrH = 0, ptrHotX = 0, ptrHotY = 0, ptrType = CG_PTR_NONE;
+    // GPU shared-texture pool (lazy: allocated by cg_dxgi_gpu_init).
+    CgGpuSlot *slots = nullptr;
+    int32_t slotCount = 0;
+    int slotW = 0;
+    int slotH = 0;
+    ID3D11Fence *fence = nullptr;
+    ID3D11DeviceContext4 *ctx4 = nullptr; // for fence Signal
+    HANDLE fenceShared = nullptr;
+    uint64_t fenceValue = 0;
     char lastError[512] = {0};
 };
 
@@ -469,6 +486,64 @@ static void fetchPointer(CgContext *c, const DXGI_OUTDUPL_FRAME_INFO *info, CgAc
     }
 }
 
+// --- Shared acquisition prologue ------------------------------------------------
+//
+// Acquires the next duplication frame and resolves it to a BGRA texture.
+// On success the caller owns `*frameOut` AND the held duplication frame and must
+// ReleaseFrame exactly once on every path (the helper releases it for errors).
+static int32_t acquireTexture(CgContext *h, int timeoutMs, ID3D11Texture2D **frameOut,
+                              DXGI_OUTDUPL_FRAME_INFO *infoOut, int *wOut, int *hOut) {
+    IDXGIResource *res = nullptr;
+    DXGI_OUTDUPL_FRAME_INFO info = {};
+    HRESULT hr = h->dupl->AcquireNextFrame((UINT)(timeoutMs < 0 ? 0 : timeoutMs), &info, &res);
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        return CG_TIMEOUT;
+    }
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+        setErrorHr(h, "AccessLost (mode change / session switch); reopen required", hr);
+        return CG_ERR_ACCESS_LOST;
+    }
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+        hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR) {
+        setErrorHr(h, "Device removed/reset; reopen required", hr);
+        return CG_ERR_DEVICE_REMOVED;
+    }
+    if (FAILED(hr) || !res) {
+        setErrorHr(h, "AcquireNextFrame failed", hr);
+        return CG_ERR_OPEN;
+    }
+
+    ID3D11Texture2D *frame = nullptr;
+    hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&frame);
+    res->Release();
+    if (FAILED(hr) || !frame) {
+        setErrorHr(h, "QueryInterface(ID3D11Texture2D) failed", hr);
+        h->dupl->ReleaseFrame();
+        return CG_ERR_COPY;
+    }
+
+    D3D11_TEXTURE2D_DESC fdesc = {};
+    frame->GetDesc(&fdesc);
+    if (fdesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        snprintf(h->lastError, sizeof(h->lastError),
+                 "Unexpected desktop format %d (only B8G8R8A8 supported)", (int)fdesc.Format);
+        frame->Release();
+        h->dupl->ReleaseFrame();
+        return CG_ERR_COPY;
+    }
+    *frameOut = frame;
+    if (infoOut) {
+        *infoOut = info;
+    }
+    if (wOut) {
+        *wOut = (int)fdesc.Width;
+    }
+    if (hOut) {
+        *hOut = (int)fdesc.Height;
+    }
+    return CG_OK;
+}
+
 // --- Full acquisition ----------------------------------------------------------
 
 int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t dstCap,
@@ -491,47 +566,15 @@ int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t d
     out->ptrW = out->ptrH = out->ptrHotX = out->ptrHotY = out->ptrType = 0;
     out->ptrShapeSize = 0;
 
-    IDXGIResource *res = nullptr;
     DXGI_OUTDUPL_FRAME_INFO info = {};
-    HRESULT hr = h->dupl->AcquireNextFrame((UINT)(timeoutMs < 0 ? 0 : timeoutMs), &info, &res);
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        return CG_TIMEOUT;
-    }
-    if (hr == DXGI_ERROR_ACCESS_LOST) {
-        setErrorHr(h, "AccessLost (mode change / session switch); reopen required", hr);
-        return CG_ERR_ACCESS_LOST;
-    }
-    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
-        hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR) {
-        setErrorHr(h, "Device removed/reset; reopen required", hr);
-        return CG_ERR_DEVICE_REMOVED;
-    }
-    if (FAILED(hr) || !res) {
-        setErrorHr(h, "AcquireNextFrame failed", hr);
-        return CG_ERR_OPEN;
+    int w = 0, bh = 0;
+    ID3D11Texture2D *frame = nullptr;
+    int32_t acq = acquireTexture(h, timeoutMs, &frame, &info, &w, &bh);
+    if (acq != CG_OK) {
+        return acq; // TIMEOUT or fatal; helper already released on errors
     }
 
     int32_t rc = CG_OK;
-    ID3D11Texture2D *frame = nullptr;
-    hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&frame);
-    res->Release();
-    if (FAILED(hr) || !frame) {
-        setErrorHr(h, "QueryInterface(ID3D11Texture2D) failed", hr);
-        h->dupl->ReleaseFrame();
-        return CG_ERR_COPY;
-    }
-
-    D3D11_TEXTURE2D_DESC fdesc = {};
-    frame->GetDesc(&fdesc);
-    if (fdesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
-        snprintf(h->lastError, sizeof(h->lastError),
-                 "Unexpected desktop format %d (only B8G8R8A8 supported)", (int)fdesc.Format);
-        frame->Release();
-        h->dupl->ReleaseFrame();
-        return CG_ERR_COPY;
-    }
-    int w = (int)fdesc.Width;
-    int bh = (int)fdesc.Height;
     if ((int64_t)dstStride * (int64_t)bh > (int64_t)dstCap) {
         setError(h, "destination buffer too small");
         frame->Release();
@@ -548,7 +591,7 @@ int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t d
     frame->Release();
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = h->ctx->Map(h->staging, 0, D3D11_MAP_READ, 0, &mapped);
+    HRESULT hr = h->ctx->Map(h->staging, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr) || !mapped.pData) {
         setErrorHr(h, "Map(staging) failed", hr);
         h->dupl->ReleaseFrame();
@@ -581,6 +624,291 @@ int32_t cg_dxgi_acquire_full(CgHandle h, void *dst, int32_t dstStride, int32_t d
     return rc;
 }
 
+// --- GPU shared-texture path ----------------------------------------------------
+//
+// Zero-copy acquisition for GPU consumers (encoders, renderers): the desktop is
+// copied GPU-side into a session-owned shared texture and handed out as an NT
+// handle together with a signaled fence value. No Map, no memcpy, no CPU touch.
+
+static void freeGpu(CgContext *h) {
+    if (h->slots) {
+        for (int32_t i = 0; i < h->slotCount; i++) {
+            if (h->slots[i].km) {
+                h->slots[i].km->Release();
+            }
+            if (h->slots[i].tex) {
+                h->slots[i].tex->Release();
+            }
+            // NOTE: h->slots[i].shared is owned by the texture; no CloseHandle.
+        }
+        free(h->slots);
+        h->slots = nullptr;
+    }
+    h->slotCount = 0;
+    if (h->fence) {
+        h->fence->Release();
+        h->fence = nullptr;
+    }
+    if (h->ctx4) {
+        h->ctx4->Release();
+        h->ctx4 = nullptr;
+    }
+    if (h->fenceShared) {
+        CloseHandle(h->fenceShared);
+        h->fenceShared = nullptr;
+    }
+    h->fenceValue = 0;
+}
+
+int32_t cg_dxgi_gpu_init(CgHandle h, int32_t slots) {
+    if (!h || slots < 2 || slots > 16) {
+        return CG_ERR_INVALID_ARG;
+    }
+    if (!h->dupl || !h->device || !h->ctx) {
+        setError(h, "handle not open");
+        return CG_ERR_OPEN;
+    }
+    if (h->slots) {
+        return CG_OK; // idempotent
+    }
+    int w = h->width > 0 ? h->width : 0;
+    int bh = h->height > 0 ? h->height : 0;
+    if (w <= 0 || bh <= 0) {
+        // Geometry unknown until the first frame; init lazily on first acquire.
+        // Record the request; slots are allocated once a frame reports its size.
+        h->slotCount = -slots; // negative = pending
+        return CG_OK;
+    }
+    // Fence first: without cross-device sync the handles are unusable.
+    // (CreateFence on Device5, Signal on DeviceContext4.)
+    ID3D11Device5 *dev5 = nullptr;
+    if (FAILED(h->device->QueryInterface(__uuidof(ID3D11Device5), (void **)&dev5)) || !dev5) {
+        setError(h, "ID3D11Fence unsupported (need Windows 10 1703+)");
+        return CG_ERR_OPEN;
+    }
+    if (FAILED(h->ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&h->ctx4)) ||
+        !h->ctx4) {
+        setError(h, "ID3D11DeviceContext4 unsupported (need Windows 10 1703+)");
+        dev5->Release();
+        return CG_ERR_OPEN;
+    }
+    HRESULT hr = dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+                                   (void **)&h->fence);
+    dev5->Release();
+    if (FAILED(hr) || !h->fence) {
+        setErrorHr(h, "CreateFence failed", hr);
+        return CG_ERR_OPEN;
+    }
+    hr = h->fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &h->fenceShared);
+    if (FAILED(hr) || !h->fenceShared) {
+        setErrorHr(h, "fence CreateSharedHandle failed", hr);
+        freeGpu(h);
+        return CG_ERR_OPEN;
+    }
+
+    h->slots = (CgGpuSlot *)calloc((size_t)slots, sizeof(CgGpuSlot));
+    if (!h->slots) {
+        freeGpu(h);
+        return CG_ERR_OPEN;
+    }
+    for (int32_t i = 0; i < slots; i++) {
+        D3D11_TEXTURE2D_DESC d = {};
+        d.Width = (UINT)w;
+        d.Height = (UINT)bh;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        d.CPUAccessFlags = 0;
+        // NOTE: SHARED_NTHANDLE alone is rejected (E_INVALIDARG) on real drivers;
+        // it must ride with SHARED_KEYEDMUTEX, which additionally gives consumers
+        // the classic AcquireSync/ReleaseSync handoff via IDXGIKeyedMutex.
+        d.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+        ID3D11Texture2D *tex = nullptr;
+        hr = h->device->CreateTexture2D(&d, nullptr, &tex);
+        if (FAILED(hr) || !tex) {
+            setErrorHr(h, "shared texture creation failed", hr);
+            freeGpu(h);
+            return CG_ERR_OPEN;
+        }
+        IDXGIResource1 *r1 = nullptr;
+        hr = tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&r1);
+        if (FAILED(hr) || !r1) {
+            setErrorHr(h, "texture is not shareable", hr);
+            tex->Release();
+            freeGpu(h);
+            return CG_ERR_OPEN;
+        }
+        HANDLE shared = nullptr;
+        hr = r1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &shared);
+        r1->Release();
+        if (FAILED(hr) || !shared) {
+            setErrorHr(h, "CreateSharedHandle failed", hr);
+            tex->Release();
+            freeGpu(h);
+            return CG_ERR_OPEN;
+        }
+        IDXGIKeyedMutex *km = nullptr;
+        hr = tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&km);
+        if (FAILED(hr) || !km) {
+            setErrorHr(h, "keyed mutex unavailable", hr);
+            tex->Release();
+            freeGpu(h);
+            return CG_ERR_OPEN;
+        }
+        h->slots[i].tex = tex;
+        h->slots[i].shared = shared;
+        h->slots[i].km = km;
+    }
+    h->slotCount = slots;
+    h->slotW = w;
+    h->slotH = bh;
+    return CG_OK;
+}
+
+// Completes a pending gpu_init once the first frame reveals the geometry.
+static int32_t ensureGpuSize(CgContext *h, int w, int bh) {
+    if (h->slotCount >= 0) {
+        if (h->slotW != w || h->slotH != bh) {
+            // Resolution changed after init: rebuild the pool (all slots must be
+            // free; a checked-out slot keeps its texture alive via Java's handle
+            // only in the logical sense — physical rebuild while busy would
+            // invalidate it, so refuse instead and let the session reopen).
+            for (int32_t i = 0; i < h->slotCount; i++) {
+                if (h->slots[i].busy) {
+                    setError(h, "resolution changed with frames in flight; reopen required");
+                    return CG_ERR_ACCESS_LOST;
+                }
+            }
+            int32_t n = h->slotCount;
+            freeGpu(h);
+            h->slotCount = -n;
+        } else {
+            return CG_OK;
+        }
+    }
+    if (h->slotCount < 0) {
+        int32_t n = -h->slotCount;
+        h->slotCount = 0;
+        h->width = w;
+        h->height = bh;
+        int32_t rc = cg_dxgi_gpu_init(h, n);
+        if (rc != CG_OK) {
+            h->slotCount = -n; // stay pending
+            return rc;
+        }
+    }
+    return CG_OK;
+}
+
+int32_t cg_dxgi_acquire_gpu(CgHandle h, int timeoutMs, CgGpuOut *out) {
+    if (!h || !out) {
+        return CG_ERR_INVALID_ARG;
+    }
+    if (!h->dupl || !h->device || !h->ctx) {
+        setError(h, "handle not open");
+        return CG_ERR_OPEN;
+    }
+    if (h->slotCount == 0) {
+        setError(h, "gpu pool not initialized (call cg_dxgi_gpu_init)");
+        return CG_ERR_INVALID_ARG;
+    }
+    // NOTE: never memset *out — it carries caller-owned rect buffers.
+    out->slot = -1;
+    out->sharedHandle = 0;
+    out->fenceHandle = (uint64_t)(uintptr_t)h->fenceShared;
+    out->fenceValue = 0;
+    out->width = 0;
+    out->height = 0;
+    out->qpc = 0;
+    out->moveCount = 0;
+    out->dirtyCount = 0;
+    out->ptrVisible = 0;
+    out->ptrX = out->ptrY = 0;
+
+    ID3D11Texture2D *frame = nullptr;
+    DXGI_OUTDUPL_FRAME_INFO info = {};
+    int w = 0, bh = 0;
+    int32_t acq = acquireTexture(h, timeoutMs, &frame, &info, &w, &bh);
+    if (acq != CG_OK) {
+        return acq;
+    }
+    int32_t rc = ensureGpuSize(h, w, bh);
+    if (rc != CG_OK) {
+        frame->Release();
+        h->dupl->ReleaseFrame();
+        return rc;
+    }
+    int32_t slot = -1;
+    for (int32_t i = 0; i < h->slotCount; i++) {
+        if (!h->slots[i].busy) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        setError(h, "no free gpu slot (close frames promptly)");
+        frame->Release();
+        h->dupl->ReleaseFrame();
+        return CG_ERR_NO_SLOT;
+    }
+
+    // Exclusive-access protocol (mandatory for SHARED_KEYEDMUTEX textures:
+    // without it cross-device reads see zeros). Single key 0 on BOTH sides —
+    // the pool's busy flags already order producer/consumer turns, so the mutex
+    // only provides GPU-cache coherency, never blocking in legitimate flows.
+    // NOTE: AcquireSync reports contention as WAIT_TIMEOUT (a *success* code!),
+    // so it must be compared explicitly — FAILED() never catches it.
+    HRESULT mhr = h->slots[slot].km->AcquireSync(0, 500);
+    if (mhr == WAIT_TIMEOUT || FAILED(mhr)) {
+        setErrorHr(h, "slot still owned by its consumer (protocol violation?)", mhr);
+        frame->Release();
+        h->dupl->ReleaseFrame();
+        return CG_ERR_COPY;
+    }
+
+    h->ctx->CopyResource(h->slots[slot].tex, frame);
+    frame->Release();
+    h->width = w;
+    h->height = bh;
+    CgAcquireOut compat = {};
+    compat.moves = out->moves;
+    compat.dirty = out->dirty;
+    fetchMoves(h, &compat);
+    fetchDirties(h, &compat);
+    out->moveCount = compat.moveCount;
+    out->dirtyCount = compat.dirtyCount;
+    out->ptrVisible = info.PointerPosition.Visible ? 1 : 0;
+    out->ptrX = info.PointerPosition.Position.x - h->originX;
+    out->ptrY = info.PointerPosition.Position.y - h->originY;
+
+    h->ctx4->Signal(h->fence, ++h->fenceValue);
+    h->slots[slot].km->ReleaseSync(0);
+
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    h->slots[slot].busy = true;
+    out->slot = slot;
+    out->sharedHandle = (uint64_t)(uintptr_t)h->slots[slot].shared;
+    out->fenceValue = h->fenceValue;
+    out->width = w;
+    out->height = bh;
+    out->qpc = (uint64_t)qpc.QuadPart;
+
+    h->dupl->ReleaseFrame();
+    return CG_OK;
+}
+
+int32_t cg_dxgi_release_gpu(CgHandle h, int32_t slot) {
+    if (!h || slot < 0 || slot >= h->slotCount || !h->slots) {
+        return CG_ERR_INVALID_ARG;
+    }
+    h->slots[slot].busy = false;
+    return CG_OK;
+}
+
 int64_t cg_qpc_frequency(void) {
     LARGE_INTEGER f;
     if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0) {
@@ -601,6 +929,7 @@ void cg_dxgi_close(CgHandle h) {
         return;
     }
     free(h->ptrShape);
+    freeGpu(h);
     if (h->staging) {
         h->staging->Release();
     }
@@ -737,6 +1066,60 @@ JNIEXPORT jint JNICALL JNI_FN(nAcquire)(JNIEnv *env, jclass CG_UNUSED cls, jlong
 
 JNIEXPORT jlong JNICALL JNI_FN(nQpcFrequency)(JNIEnv *env CG_UNUSED, jclass CG_UNUSED cls) {
     return (jlong)cg_qpc_frequency();
+}
+
+JNIEXPORT jint JNICALL JNI_FN(nGpuInit)(JNIEnv *env CG_UNUSED, jclass CG_UNUSED cls,
+                                        jlong handle, jint slots) {
+    CgHandle h = (CgHandle)(intptr_t)handle;
+    if (!h) {
+        return CG_ERR_INVALID_ARG;
+    }
+    return cg_dxgi_gpu_init(h, (int32_t)slots);
+}
+
+// gpuMeta (long[7]): {slot, sharedHandle, fenceHandle, fenceValue, width, height, qpc}
+// meta (int[4]): {width, height, moveCount, dirtyCount}
+// ptr (int[3]): {visible, x, y}
+JNIEXPORT jint JNICALL JNI_FN(nAcquireGpu)(JNIEnv *env, jclass CG_UNUSED cls, jlong handle,
+                                           jint timeoutMs, jlongArray gpuMeta, jintArray meta,
+                                           jobject moves, jobject dirties, jintArray ptr) {
+    CgHandle h = (CgHandle)(intptr_t)handle;
+    if (!h) {
+        return CG_ERR_INVALID_ARG;
+    }
+    CgMove *moveBuf = moves ? (CgMove *)env->GetDirectBufferAddress(moves) : nullptr;
+    CgRect *dirtyBuf = dirties ? (CgRect *)env->GetDirectBufferAddress(dirties) : nullptr;
+
+    CgGpuOut o = {};
+    o.moves = moveBuf;
+    o.dirty = dirtyBuf;
+    int32_t rc = cg_dxgi_acquire_gpu(h, (int)timeoutMs, &o);
+    if (rc != CG_OK) {
+        return rc;
+    }
+    if (gpuMeta) {
+        jlong v[7] = {(jlong)o.slot, (jlong)o.sharedHandle, (jlong)o.fenceHandle,
+                      (jlong)o.fenceValue, (jlong)o.width, (jlong)o.height, (jlong)o.qpc};
+        env->SetLongArrayRegion(gpuMeta, 0, 7, v);
+    }
+    if (meta) {
+        jint v[4] = {o.width, o.height, o.moveCount, o.dirtyCount};
+        env->SetIntArrayRegion(meta, 0, 4, v);
+    }
+    if (ptr) {
+        jint v[3] = {o.ptrVisible, o.ptrX, o.ptrY};
+        env->SetIntArrayRegion(ptr, 0, 3, v);
+    }
+    return rc;
+}
+
+JNIEXPORT jint JNICALL JNI_FN(nReleaseGpu)(JNIEnv *env CG_UNUSED, jclass CG_UNUSED cls,
+                                           jlong handle, jint slot) {
+    CgHandle h = (CgHandle)(intptr_t)handle;
+    if (!h) {
+        return CG_ERR_INVALID_ARG;
+    }
+    return cg_dxgi_release_gpu(h, (int32_t)slot);
 }
 
 JNIEXPORT jstring JNICALL JNI_FN(nLastError)(JNIEnv *env, jclass CG_UNUSED cls, jlong handle) {
