@@ -1,0 +1,33 @@
+name: windows-build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build native DLL
+        working-directory: capture-native
+        run: .\build-win-x64.cmd
+
+      - name: Verify DLL exports
+        run: dumpbin /EXPORTS capture-backend-win-dxgi\src\main\resources\natives\win-x64\capture_dxgi.dll
+
+      - name: Build + test (Maven)
+        run: mvn -B test
