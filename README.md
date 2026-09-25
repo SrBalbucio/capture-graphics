@@ -1,3 +1,5 @@
+[![](https://img.shields.io/badge/HyperPowered-Use%20the%20official%20repository-yellow?color=%23279BF8&cacheSeconds=3600)](https://maven.dev.hyperpowered.net/#/releases/balbucio/capturegraphics)
+
 # capture-graphics
 
 Java desktop frame acquisition API with interchangeable native backends and a
