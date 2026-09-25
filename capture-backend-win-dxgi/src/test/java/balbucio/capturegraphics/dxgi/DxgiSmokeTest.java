@@ -42,6 +42,12 @@ class DxgiSmokeTest {
                     assertEquals(f.width() * f.height() * 4, f.data().remaining(),
                             "buffer must expose the full copied frame");
                     assertTrue(f.meta().fullFrame());
+                    assertFalse(f.meta().dirty().isEmpty(), "dirty list always populated");
+                    for (var r : f.meta().dirty()) {
+                        assertTrue(r.x() >= 0 && r.y() >= 0);
+                        assertTrue(r.x() + r.width() <= f.width());
+                        assertTrue(r.y() + r.height() <= f.height());
+                    }
                     lastSeq = f.meta().sequence();
                     lastPts = f.meta().ptsNanos();
                     got++;
@@ -52,5 +58,33 @@ class DxgiSmokeTest {
         } catch (CaptureException e) {
             assumeTrue(false, "DXGI unavailable in this session: " + e.reason() + " " + e.getMessage());
         }
+    }
+
+    @Test
+    void acquireWithCursor() throws Exception {
+        assumeTrue(NativeLibLoader.isWindowsX64(), "requires Windows x64");
+        CaptureConfig config = CaptureConfig.builder().timeoutMs(100).targetFps(60).cursor(true).build();
+        try (var session = new DxgiBackend().open(config)) {
+            int got = 0;
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (got < 5 && System.currentTimeMillis() < deadline) {
+                try (var f = session.acquire()) {
+                    if (f != null) {
+                        got++;
+                    }
+                }
+            }
+            assertTrue(got >= 3, "expected cursor-composited frames, got " + got);
+        } catch (CaptureException e) {
+            assumeTrue(false, "DXGI unavailable in this session: " + e.reason() + " " + e.getMessage());
+        }
+    }
+
+    @Test
+    void enumeratesOutputs() {
+        assumeTrue(NativeLibLoader.isWindowsX64(), "requires Windows x64");
+        var displays = new DxgiBackend().displays();
+        assertFalse(displays.isEmpty());
+        assertTrue(displays.get(0).width() > 0);
     }
 }

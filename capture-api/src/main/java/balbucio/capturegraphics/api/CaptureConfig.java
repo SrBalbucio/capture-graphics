@@ -7,6 +7,7 @@ public final class CaptureConfig {
     private final int timeoutMs;
     private final int framePoolSize;
     private final long targetFps;
+    private final boolean cursor;
 
     private CaptureConfig(Builder b) {
         this.display = b.display;
@@ -14,6 +15,7 @@ public final class CaptureConfig {
         this.timeoutMs = b.timeoutMs;
         this.framePoolSize = b.framePoolSize;
         this.targetFps = b.targetFps;
+        this.cursor = b.cursor;
     }
 
     public DisplayId display() {
@@ -36,6 +38,11 @@ public final class CaptureConfig {
         return targetFps;
     }
 
+    /** Whether to composite the cursor onto captured frames (backend-dependent, default off). */
+    public boolean cursor() {
+        return cursor;
+    }
+
     /** BGRA 60fps, 16ms timeout, pool sized for ~150ms of buffering. */
     public static CaptureConfig bgra() {
         return builder().build();
@@ -51,6 +58,7 @@ public final class CaptureConfig {
         private int timeoutMs = 16;
         private int framePoolSize = 11; // ceil(60 * 0.15) + 2
         private long targetFps = 60;
+        private boolean cursor = false;
 
         public Builder display(DisplayId d) {
             this.display = d;
@@ -74,6 +82,11 @@ public final class CaptureConfig {
 
         public Builder targetFps(long fps) {
             this.targetFps = fps;
+            return this;
+        }
+
+        public Builder cursor(boolean enabled) {
+            this.cursor = enabled;
             return this;
         }
 

@@ -2,7 +2,20 @@
 rem Builds capture_dxgi.dll (Windows x64) with MSVC. Run from capture-native\.
 rem Requires: VS 2022 + Windows 10/11 SDK. Copies the DLL into the Java module resources.
 setlocal
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+rem Skip vcvarsall when cl is already on PATH (CI uses msvc-dev-cmd).
+where cl >nul 2>&1
+if errorlevel 1 (
+  if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" (
+    call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+  ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" (
+    call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+  ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" (
+    call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+  ) else (
+    echo cl.exe not found and no vcvarsall.bat located. Install VS 2022 + Windows SDK.
+    exit /b 1
+  )
+)
 if not defined JAVA_HOME (
   echo JAVA_HOME not set ^(point it at a JDK^)
   exit /b 1
