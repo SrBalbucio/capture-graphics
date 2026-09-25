@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased (1.1.0)
+
+- New `capture-all` aggregator module: single dependency with every bundled
+  backend; runtime pick + graceful fallback via ServiceLoader.
+
 ## 1.0.0 — first release
 
 Foundation (Phase 0): multi-module Maven build (Java 21, JPMS), stable `capture-api`

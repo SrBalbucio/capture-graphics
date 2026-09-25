@@ -25,8 +25,19 @@ streaming protocols.
 | `capture-compat-awt` | Optional `BufferedImage`/Swing adapters (copy cost, keep off the hot path) |
 | `capture-bench` | JMH benchmarks |
 | `capture-native` | C ABI + DXGI bridge + GPU shared-texture pool (MSVC, CMakeLists for CI) |
+| `capture-all` | Multiplatform aggregator: one dependency, runtime backend pick + fallback |
 
 ## Quickstart
+
+For applications, depend on the aggregator only:
+
+```xml
+<dependency>
+  <groupId>balbucio.capturegraphics</groupId>
+  <artifactId>capture-all</artifactId>
+  <version>1.0</version>
+</dependency>
+```
 
 ```java
 // Pull model (recorders): mirrors DXGI, caller owns each frame.

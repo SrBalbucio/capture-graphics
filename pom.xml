@@ -6,7 +6,7 @@
 
     <groupId>balbucio.capturegraphics</groupId>
     <artifactId>capture-graphics-parent</artifactId>
-    <version>1.0</version>
+    <version>1.1-SNAPSHOT</version>
     <packaging>pom</packaging>
     <name>capture-graphics (parent)</name>
 
@@ -30,6 +30,7 @@
         <module>capture-backend-win-dxgi</module>
         <module>capture-compat-awt</module>
         <module>capture-bench</module>
+        <module>capture-all</module>
     </modules>
 
     <properties>
@@ -59,6 +60,16 @@
             <dependency>
                 <groupId>balbucio.capturegraphics</groupId>
                 <artifactId>capture-backend-win-dxgi</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>balbucio.capturegraphics</groupId>
+                <artifactId>capture-compat-awt</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>balbucio.capturegraphics</groupId>
+                <artifactId>capture-all</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

@@ -8,7 +8,12 @@
         <artifactId>capture-graphics-parent</artifactId>
         <version>1.1-SNAPSHOT</version>
     </parent>
-    <artifactId>capture-compat-awt</artifactId>
+    <artifactId>capture-all</artifactId>
+    <name>capture-all (multiplatform aggregator)</name>
+    <description>Single dependency for applications: API + every bundled backend.
+        Backends are picked at runtime via ServiceLoader with graceful fallback
+        (win-dxgi -&gt; robot), so the same artifact runs on any platform and
+        future Linux/macOS backends plug in without consumer changes.</description>
     <dependencies>
         <dependency>
             <groupId>balbucio.capturegraphics</groupId>
@@ -17,7 +22,18 @@
         <dependency>
             <groupId>balbucio.capturegraphics</groupId>
             <artifactId>capture-core</artifactId>
-            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>balbucio.capturegraphics</groupId>
+            <artifactId>capture-backend-robot</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>balbucio.capturegraphics</groupId>
+            <artifactId>capture-backend-win-dxgi</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>balbucio.capturegraphics</groupId>
+            <artifactId>capture-compat-awt</artifactId>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
