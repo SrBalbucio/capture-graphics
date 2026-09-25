@@ -10,6 +10,7 @@ import balbucio.capturegraphics.api.DisplayId;
 import balbucio.capturegraphics.api.FrameFormat;
 import balbucio.capturegraphics.api.FrameListener;
 import balbucio.capturegraphics.api.FrameMeta;
+import balbucio.capturegraphics.api.GpuCaptureSession;
 import balbucio.capturegraphics.api.Rect;
 import balbucio.capturegraphics.api.SessionMetrics;
 import balbucio.capturegraphics.core.FramePool;
@@ -46,7 +47,7 @@ public final class DxgiBackend implements CaptureBackend {
     @Override
     public Capabilities capabilities() {
         return new Capabilities(Set.of(FrameFormat.BGRA_8), true, true,
-                7680, 4320, false);
+                7680, 4320, false, true);
     }
 
     @Override
@@ -133,7 +134,56 @@ public final class DxgiBackend implements CaptureBackend {
         return new DxgiSession(handle, output, resolved, config, pool, freq);
     }
 
-    private static long openHandle(int output) throws CaptureException {
+    @Override
+    public GpuCaptureSession openGpu(CaptureConfig config) throws CaptureException {
+        if (config.format() != FrameFormat.BGRA_8) {
+            throw new CaptureException(CaptureException.Reason.UNSUPPORTED_FORMAT,
+                    "DXGI supports only BGRA_8");
+        }
+        try {
+            NativeLibLoader.ensureLoaded();
+        } catch (IllegalStateException e) {
+            throw new CaptureException(CaptureException.Reason.NATIVE_ERROR,
+                    "Native library unavailable: " + e.getMessage(), e);
+        }
+        if (config.cursor()) {
+            LOG.log(Logger.Level.WARNING,
+                    "Cursor compositing needs a CPU buffer; ignored in GPU mode. "
+                            + "Consumers draw the cursor themselves.");
+        }
+        int output = outputIndex(config.display());
+        long handle = openHandle(output);
+        int[] info = DxgiNative.nInfo(handle);
+        if (info == null || info[0] <= 0 || info[1] <= 0) {
+            int[] desc = new int[5];
+            if (DxgiNative.nOutputDesc(0, output, desc) == DxgiNative.CG_OK) {
+                info = new int[]{desc[2], desc[3], desc[2] * 4};
+            } else {
+                DxgiNative.nClose(handle);
+                throw new CaptureException(CaptureException.Reason.NATIVE_ERROR,
+                        "Could not determine output size");
+            }
+        }
+        long freq = DxgiNative.nQpcFrequency();
+        if (freq <= 0) {
+            DxgiNative.nClose(handle);
+            throw new CaptureException(CaptureException.Reason.NATIVE_ERROR, "QPC unavailable");
+        }
+        int slots = Math.min(16, Math.max(2, config.framePoolSize()));
+        int rc = DxgiNative.nGpuInit(handle, slots);
+        if (rc != DxgiNative.CG_OK) {
+            String detail = DxgiNative.nLastError(handle);
+            DxgiNative.nClose(handle);
+            throw new CaptureException(CaptureException.Reason.NATIVE_ERROR,
+                    "GPU pool init failed (need Windows 10 1703+): " + detail);
+        }
+        DisplayId resolved = resolveDisplay(output, info[0], info[1]);
+        LOG.log(Logger.Level.INFO, "DXGI GPU backend opened output {0} {1}x{2} slots={3}",
+                output, info[0], info[1], slots);
+        return new DxgiGpuSession(handle, output, resolved, config, freq);
+    }
+
+    static long openHandle(int output) throws CaptureException {
         try {
             long handle = DxgiNative.nOpen(0, output);
             if (handle == 0) {
@@ -146,7 +196,7 @@ public final class DxgiBackend implements CaptureBackend {
         }
     }
 
-    private static DisplayId resolveDisplay(int output, int w, int h) {
+    static DisplayId resolveDisplay(int output, int w, int h) {
         int[] desc = new int[5];
         if (DxgiNative.nOutputDesc(0, output, desc) == DxgiNative.CG_OK) {
             return new DisplayId("dxgi-output-" + output, "DXGI output " + output,

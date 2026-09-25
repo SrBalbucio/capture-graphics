@@ -53,6 +53,18 @@ final class DxgiNative {
                                long[] qpc, int[] meta, ByteBuffer moves, ByteBuffer dirties,
                                int[] ptr, ByteBuffer shape);
 
+    static native int nGpuInit(long handle, int slots);
+
+    /**
+     * Zero-copy acquire. gpuMeta (long[7]): {slot, sharedHandle, fenceHandle,
+     * fenceValue, width, height, qpc}; meta (int[4]): {width, height, moveCount,
+     * dirtyCount}; ptr (int[3]): {visible, x, y}.
+     */
+    static native int nAcquireGpu(long handle, int timeoutMs, long[] gpuMeta, int[] meta,
+                                  ByteBuffer moves, ByteBuffer dirties, int[] ptr);
+
+    static native int nReleaseGpu(long handle, int slot);
+
     static native long nQpcFrequency();
 
     static native String nLastError(long handle);
