@@ -22,7 +22,7 @@ if not defined JAVA_HOME (
 )
 set SDK_INC=C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0
 set SDK_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0
-cl /nologo /O2 /EHsc /MD /LD /DCAPTURE_DXGI_BUILD /DUNICODE /D_UNICODE ^
+cl /nologo /O2 /EHsc /MT /LD /DCAPTURE_DXGI_BUILD /DUNICODE /D_UNICODE ^
   /I include /I "%JAVA_HOME%\include" /I "%JAVA_HOME%\include\win32" ^
   /I "%SDK_INC%\um" /I "%SDK_INC%\shared" /I "%SDK_INC%\ucrt" ^
   src\dxgi_bridge.cpp ^
